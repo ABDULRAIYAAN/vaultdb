@@ -1,0 +1,15 @@
+# Build output
+/bin/
+*.exe
+/vaultdb
+
+# Database files
+/data/
+*.db
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

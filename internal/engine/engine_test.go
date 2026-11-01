@@ -1,0 +1,84 @@
+package engine
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/ABDULRAIYAAN/vaultdb/internal/parser"
+	"github.com/ABDULRAIYAAN/vaultdb/internal/store"
+)
+
+func run(t *testing.T, e *Engine, line string) string {
+	t.Helper()
+	cmd, err := parser.Parse(line)
+	if err != nil {
+		t.Fatalf("Parse(%q): %v", line, err)
+	}
+	return e.Execute(cmd)
+}
+
+func TestSession(t *testing.T) {
+	e := New(store.New())
+	steps := []struct{ in, want string }{
+		{`GET name`, `(nil)`},
+		{`SET name raiyaan`, `OK`},
+		{`GET name`, `"raiyaan"`},
+		{`SET bio "CS student at Taylor's"`, `OK`},
+		{`GET bio`, `"CS student at Taylor's"`},
+		{`EXISTS name`, `(integer) 1`},
+		{`COUNT`, `(integer) 2`},
+		{`KEYS`, "1) \"bio\"\n2) \"name\""},
+		{`DEL name`, `(integer) 1`},
+		{`DEL name`, `(integer) 0`},
+		{`EXISTS name`, `(integer) 0`},
+		{`CLEAR`, `OK`},
+		{`KEYS`, `(empty)`},
+		{`INFO`, "mode: in-memory (nothing saved)\nkeys: 0\nlog size: 0 bytes"},
+	}
+	for _, s := range steps {
+		if got := run(t, e, s.in); got != s.want {
+			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
+	}
+}
+
+func TestErrors(t *testing.T) {
+	e := New(store.New())
+	cases := map[string]string{
+		`SET onlykey`: `(error) usage: SET <key> <value>`,
+		`GET`:         `(error) usage: GET <key>`,
+		`SET "" v`:    `(error) key must not be empty`,
+		`FLY away`:    `(error) unknown command "FLY", type HELP for the list`,
+	}
+	for in, want := range cases {
+		if got := run(t, e, in); got != want {
+			t.Errorf("%s\n got: %s\nwant: %s", in, got, want)
+		}
+	}
+}
+
+func TestPersistentEngine(t *testing.T) {
+	path := t.TempDir() + "/vaultdb.log"
+	s, _, err := store.Open(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := New(s)
+	run(t, e, `SET name raiyaan`)
+	run(t, e, `SET x 1`)
+	run(t, e, `DEL x`)
+	s.Close()
+
+	s2, _, err := store.Open(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	e2 := New(s2)
+	if got := run(t, e2, `GET name`); got != `"raiyaan"` {
+		t.Fatalf("GET name after restart = %s", got)
+	}
+	if got := run(t, e2, `INFO`); !strings.HasPrefix(got, "mode: persistent") {
+		t.Fatalf("INFO = %s", got)
+	}
+}
