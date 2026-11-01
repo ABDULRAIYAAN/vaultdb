@@ -1,0 +1,3 @@
+# Keep line endings consistent across Windows and Linux/macOS
+* text=auto eol=lf
+*.bat text eol=crlf
