@@ -9,6 +9,14 @@ const $ = (id) => document.getElementById(id);
 // ---------- Hero: live B-tree ----------
 const tree = createTreeViz($("tree-stage"), $("tree-caption"), reduceMotion);
 const opening = [40, 15, 72, 8, 23, 56, 91, 34, 63, 5, 47, 80];
+// The card swings into its resting 3D angle as the page opens.
+if (!reduceMotion) {
+  animate(
+    $("tree-card"),
+    { transform: ["rotateX(28deg) rotateY(-32deg) translateZ(-120px)", getComputedStyle($("tree-card")).transform], opacity: [0, 1] },
+    { duration: 1.3, ease: [0.2, 0.8, 0.2, 1] }
+  );
+}
 if (reduceMotion) {
   opening.forEach((k) => tree.insert(k));
 } else {
@@ -203,6 +211,7 @@ refreshServerLine();
 // ---------- HNSW drawing ----------
 const hnsw = createHnswViz($("hnsw"), reduceMotion);
 $("hnsw-run").addEventListener("click", (e) => hnsw.search(e.currentTarget));
+$("hnsw-turn").addEventListener("click", () => hnsw.turn());
 
 // ---------- Ask the docs ----------
 $("ask-form").addEventListener("submit", async (e) => {

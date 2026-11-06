@@ -38,7 +38,8 @@
       </div>
     </div>
 
-    <figure class="tree-card" aria-labelledby="tree-caption">
+    <div class="tree-wrap">
+    <figure class="tree-card" id="tree-card" aria-labelledby="tree-caption">
       <div class="tree-stage" id="tree-stage" role="img" aria-label="A B-tree that grows as keys are inserted"></div>
       <figcaption>
         <p id="tree-caption" class="tree-caption" aria-live="polite">This is VaultDB's B-tree logic, running in your browser.</p>
@@ -50,6 +51,7 @@
         </form>
       </figcaption>
     </figure>
+    </div>
   </section>
 
   <section id="playground" class="section" aria-labelledby="pg-title">
@@ -103,9 +105,11 @@
         <p>Vector search finds the stored items closest in meaning to a question. Checking every item is exact but slow, so VaultDB builds an HNSW graph: a few long-distance links on the top layer, more detailed links below.</p>
         <p>A search starts at the top, hops towards the target until it can't get closer, then drops a layer. On 100,000 vectors that is 81 times faster than checking everything, and it still finds 99.5% of the true nearest neighbours.</p>
         <button class="btn small" type="button" id="hnsw-run">Run a search</button>
-        <p class="fine">A simplified two-dimensional drawing of the real algorithm. Real embeddings have hundreds of dimensions.</p>
+        <p class="fine">A simplified drawing of the real algorithm, with points on flat layers. Real embeddings have hundreds of dimensions.</p>
       </div>
-      <div class="hnsw" id="hnsw" role="img" aria-label="Three graph layers; a search hops down from the top layer to the nearest point"></div>
+      <div class="hnsw" id="hnsw" role="img" aria-label="Three graph layers stacked in 3D; a search hops across the top layer, then drops down layer by layer to the nearest point">
+        <button class="btn small quiet hnsw-toggle" type="button" id="hnsw-turn">Turn the view</button>
+      </div>
     </div>
 
     <div class="split reverse">

@@ -1,0 +1,30 @@
+[Unit]
+Description=VaultDB playground website
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/vaultdb/vaultdb-web -addr 127.0.0.1:8080 -https -trust-proxy -docs /opt/vaultdb/docs
+EnvironmentFile=-/etc/vaultdb/env
+Restart=on-failure
+RestartSec=3
+
+# Run as a throwaway user with no access to the rest of the system.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+MemoryMax=600M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+# Caddy gets and renews HTTPS certificates for these names automatically.
+{DOMAIN} {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
+	log {
+		output discard
+	}
+}
+
+www.{DOMAIN} {
+	redir https://{DOMAIN}{uri} permanent
+}

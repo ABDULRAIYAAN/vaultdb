@@ -22,6 +22,7 @@ const fonts = {
   "bricolage.woff2": "@fontsource-variable/bricolage-grotesque/files/bricolage-grotesque-latin-wght-normal.woff2",
   "jbmono-400.woff2": "@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2",
   "jbmono-600.woff2": "@fontsource/jetbrains-mono/files/jetbrains-mono-latin-600-normal.woff2",
+  "dancing.woff2": "@fontsource-variable/dancing-script/files/dancing-script-latin-wght-normal.woff2",
 };
 mkdirSync(join(src, "fonts"), { recursive: true });
 for (const [name, from] of Object.entries(fonts)) {

@@ -153,10 +153,12 @@ go run ./cmd/vaultdb-web          # then open http://localhost:8080
 
 On Windows, double-click `web.bat`.
 
+To put it online, see [`deploy/DEPLOY.md`](deploy/DEPLOY.md): one script sets up an Oracle Cloud free-tier server with Caddy for automatic HTTPS and a hardened systemd service.
+
 - **Every visitor gets a private, in-memory database**, deleted after 30 minutes idle, capped at 1 MB. Nobody can see anyone else's data.
 - **Hardened for the public internet:** per-IP rate limits, 4 KB commands, 16 KB request bodies, server timeouts, a strict Content-Security-Policy (no inline scripts or styles, no third-party requests), `nosniff`, `frame-ancestors 'none'`, HSTS on HTTPS, and random `HttpOnly`, `SameSite=Strict` cookies. A daily cap protects any paid AI key behind the docs assistant.
 - **One binary.** The front end is built into the server with `go:embed`, so deploying means copying one file.
-- **Front end:** plain JavaScript with [Motion](https://motion.dev) for animation, bundled by esbuild into 175 KB including self-hosted fonts. The B-tree drawing uses the same insert-and-split rules as the Go code. Animations respect `prefers-reduced-motion`. Source in `web/src`; rebuild with `cd web && npm install && npm run build`.
+- **Front end:** plain JavaScript with [Motion](https://motion.dev) for animation and CSS 3D transforms (a tilted B-tree card, and HNSW layers stacked in 3D space that a search drops through), bundled by esbuild into about 220 KB including self-hosted fonts. Buttons use a frosted "liquid glass" style. The B-tree drawing uses the same insert-and-split rules as the Go code. Animations respect `prefers-reduced-motion`, and glass falls back to solid with `prefers-reduced-transparency`. Source in `web/src`; rebuild with `cd web && npm install && npm run build`.
 
 ## Chat with your documents (RAG)
 
@@ -305,6 +307,7 @@ vaultdb/
   internal/web/       playground server: sandboxes, rate limits, security headers, JSON API
   cmd/vaultdb-web/    runs the playground website
   web/                the website: src/ (HTML, CSS, JS), dist/ (built, embedded into the binary)
+  deploy/             Oracle Cloud setup script, systemd service, Caddy config, step-by-step guide
   internal/server/    TCP server: goroutine per client, length-prefixed replies, limits, graceful shutdown
   internal/client/    Go client library for the protocol
   cmd/vaultdb-cli/    command-line client (interactive or one-shot with -c)
