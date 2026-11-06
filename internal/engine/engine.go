@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/ABDULRAIYAAN/vaultdb/internal/parser"
+	"github.com/ABDULRAIYAAN/vaultdb/internal/sql"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/store"
 )
 
@@ -28,16 +29,51 @@ const HelpText = `Commands:
   INFO                storage stats: keys, log size, garbage
   COMPACT             rewrite the log with only current data
   HELP                show this list
-  EXIT                quit`
+  EXIT                quit
+
+SQL (tables are stored as keys under sql:):
+  CREATE TABLE students (id INT PRIMARY KEY, name TEXT, gpa FLOAT, active BOOL)
+  INSERT INTO students VALUES (1, 'Ali', 3.5, TRUE), (2, 'Sara', 3.8, FALSE)
+  SELECT name, gpa FROM students WHERE gpa > 3.6 ORDER BY gpa DESC LIMIT 10
+  SELECT COUNT(*) FROM students WHERE active = TRUE
+  UPDATE students SET gpa = 4.0 WHERE id = 1
+  DELETE FROM students WHERE id = 2
+  SHOW TABLES  |  DROP TABLE students`
 
 // Engine executes commands.
 type Engine struct {
 	store *store.Store
+	sql   *sql.Executor
 }
 
 // New creates an Engine backed by s.
 func New(s *store.Store) *Engine {
-	return &Engine{store: s}
+	return &Engine{store: s, sql: sql.NewExecutor(s)}
+}
+
+var sqlStarts = map[string]bool{
+	"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true,
+	"CREATE": true, "DROP": true, "SHOW": true,
+}
+
+// ExecuteLine runs one line typed by the user. Lines that start with a SQL
+// word go to the SQL executor; everything else is a key-value command.
+func (e *Engine) ExecuteLine(line string) string {
+	if first := strings.Fields(line); len(first) > 0 && sqlStarts[strings.ToUpper(first[0])] {
+		res, err := e.sql.Exec(line)
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return sql.FormatTable(res)
+	}
+	cmd, err := parser.Parse(line)
+	if err != nil {
+		return "(error) " + err.Error()
+	}
+	if cmd.Name == "" {
+		return ""
+	}
+	return e.Execute(cmd)
 }
 
 // Execute runs cmd and returns the text to show the user.

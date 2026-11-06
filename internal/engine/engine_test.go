@@ -113,3 +113,21 @@ func TestScanAndPrefix(t *testing.T) {
 		}
 	}
 }
+
+func TestExecuteLineRoutesSQL(t *testing.T) {
+	e := New(store.New())
+	steps := []struct{ in, want string }{
+		{`create table t (id INT PRIMARY KEY, name TEXT)`, "OK, table t created"},
+		{`INSERT INTO t VALUES (1, 'Ali')`, "OK, 1 row inserted"},
+		{`SELECT name FROM t`, "+-------+\n| name  |\n+-------+\n| 'Ali' |\n+-------+\n(1 row)"},
+		{`SELECT * FROM missing`, "(error) table missing does not exist"},
+		{`SET plain value`, "OK"},
+		{`GET plain`, `"value"`},
+		{`   `, ""},
+	}
+	for _, s := range steps {
+		if got := e.ExecuteLine(s.in); got != s.want {
+			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
+	}
+}

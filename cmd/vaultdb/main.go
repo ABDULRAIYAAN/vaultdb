@@ -20,14 +20,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 
 	"github.com/ABDULRAIYAAN/vaultdb/internal/aol"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/engine"
-	"github.com/ABDULRAIYAAN/vaultdb/internal/parser"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/store"
 )
 
-const version = "0.4.0"
+const version = "0.5.0"
 
 func main() {
 	dataPath := flag.String("data", filepath.Join("data", "vaultdb.log"), "log file to store data in")
@@ -75,19 +75,15 @@ func main() {
 			break // Ctrl+D / Ctrl+Z or end of piped input
 		}
 
-		cmd, err := parser.Parse(scanner.Text())
-		if err != nil {
-			fmt.Println("(error)", err)
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
 			continue
 		}
-		if cmd.Name == "" {
-			continue
-		}
-		if cmd.Name == "EXIT" || cmd.Name == "QUIT" {
+		if w := strings.ToUpper(line); w == "EXIT" || w == "QUIT" {
 			fmt.Println("Bye.")
 			break
 		}
-		fmt.Println(eng.Execute(cmd))
+		fmt.Println(eng.ExecuteLine(line))
 	}
 
 	if err := db.Close(); err != nil {

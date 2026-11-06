@@ -6,7 +6,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.4.0: Milestone 4 complete.** Keys live in a B-tree, so they are always sorted and range and prefix queries only touch matching keys. Data is saved to a checksummed append-only log that survives crashes and compacts itself.
+**v0.5.0: Milestone 5 complete.** VaultDB speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -17,7 +17,7 @@ go run ./cmd/vaultdb
 ```
 
 ```
-VaultDB 0.4.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.5.0. Type HELP for commands, EXIT to quit.
 Loaded 0 keys from data/vaultdb.log (0 log records).
 vaultdb> SET name raiyaan
 OK
@@ -30,7 +30,7 @@ Bye.
 Start it again and the data is still there:
 
 ```
-VaultDB 0.4.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.5.0. Type HELP for commands, EXIT to quit.
 Loaded 2 keys from data/vaultdb.log (2 log records).
 vaultdb> GET name
 "raiyaan"
@@ -51,6 +51,49 @@ Run the tests (the `-race` flag checks for concurrency bugs; on Windows it needs
 ```bash
 go test -race ./...
 ```
+
+## SQL
+
+```
+vaultdb> CREATE TABLE students (id INT PRIMARY KEY, name TEXT, gpa FLOAT)
+OK, table students created
+vaultdb> INSERT INTO students VALUES (1, 'Raiyaan', 3.9), (2, 'Ali', 3.2), (3, 'Sara', 3.6)
+OK, 3 rows inserted
+vaultdb> SELECT name, gpa FROM students WHERE gpa > 3.5 ORDER BY gpa DESC
++-----------+-----+
+| name      | gpa |
++-----------+-----+
+| 'Raiyaan' | 3.9 |
+| 'Sara'    | 3.6 |
++-----------+-----+
+(2 rows)
+```
+
+Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, `COUNT(*)`, `WHERE`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL` and brackets.
+
+### How SQL runs
+
+```
+"SELECT name FROM students WHERE gpa > 3.5"
+        |
+   lexer      -> tokens: SELECT  name  FROM  students  WHERE  gpa  >  3.5
+        |
+   parser     -> tree:   Select{Columns:[name], Table:students, Where: gpa > 3.5}
+        |
+   executor   -> reads rows from the key-value store, filters, sorts, picks columns
+```
+
+**Tables are just keys.** There is no separate table engine, the same approach used by CockroachDB and TiDB:
+
+```
+sql:schema:students                   {"columns":[{"name":"id","type":"INT","pk":true}, ...]}
+sql:row:students:8000000000000001     [1,"Raiyaan",3.9]
+sql:row:students:8000000000000002     [2,"Ali",3.2]
+```
+
+Because the store is a B-tree, a table's rows sit next to each other, so a full table read is one prefix walk. `WHERE id = 2` on the primary key skips the walk and does a single key lookup. Integer keys are written as 16 hex digits with the sign bit flipped, so key order matches number order, negatives included.
+
+Rules the executor enforces: types must match the column (an `INT` is accepted in a `FLOAT` column), primary keys must be unique and not `NULL`, a multi-row `INSERT` is checked completely before any row is written, and comparing with `NULL` is never true (use `IS NULL`), as in standard SQL.
 
 ## Commands
 
@@ -90,6 +133,7 @@ vaultdb/
   internal/engine/    runs commands, returns replies (reused by the TCP server later)
   internal/store/     the data: B-tree in memory, write-ahead rule, compaction
   internal/btree/     sorted in-memory index: insert with splits, delete with borrow/merge, range walks
+  internal/sql/       SQL lexer, recursive descent parser, AST, executor, result tables
   internal/aol/       the log file: record format, checksums, append, replay, crash recovery, atomic rewrite
 ```
 
@@ -154,7 +198,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 2. Persistence: append-only log, so data survives a restart
 - [x] 3. Crash recovery (checksums) and log compaction
 - [x] 4. Indexing: B-tree for sorted keys, range and prefix queries
-- [ ] 5. A small SQL-like query language (`CREATE TABLE`, `INSERT`, `SELECT ... WHERE`)
+- [x] 5. A small SQL-like query language (`CREATE TABLE`, `INSERT`, `SELECT ... WHERE`, `UPDATE`, `DELETE`)
 - [ ] 6. TCP server so multiple clients can connect
 - [ ] 7. Vector search: store embeddings, nearest-neighbour queries (brute force, then HNSW)
 - [ ] 8. Benchmarks
