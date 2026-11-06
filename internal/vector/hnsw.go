@@ -94,6 +94,15 @@ func NewHNSW(metric Metric, m, efConstruction, efSearch int) *HNSW {
 // Len returns the number of live vectors.
 func (h *HNSW) Len() int { return len(h.ids) }
 
+// SetEfSearch changes how many candidates a search considers. Higher finds
+// the true neighbours more often but takes longer. It must not be called
+// while searches are running.
+func (h *HNSW) SetEfSearch(ef int) {
+	if ef > 0 {
+		h.efSrch = ef
+	}
+}
+
 // prepare stores cosine vectors at length 1, so cosine distance becomes the
 // cheaper 1 - (a·b) at search time.
 func (h *HNSW) prepare(v Vector) Vector {

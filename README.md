@@ -123,14 +123,25 @@ A search starts at the top, walks greedily towards the query, drops a layer, and
 - **Deletes are tombstones** (deleted nodes remain as stepping stones but are never returned); the graph is rebuilt when tombstones outnumber live vectors.
 - **Parallel searches** reuse "visited" sets from a pool, marked with a stamp number so they never need clearing.
 
-Measured on 10,000 random 128-dimension vectors (M=16, efConstruction=200, efSearch=64):
+### Benchmarks
 
-| Index | Search time (k=10) | Recall@10 |
-|---|---|---|
-| FLAT (exact) | 1.96 ms | 100% |
-| HNSW | 0.40 ms | 99.1% (cosine), 99.5% (L2) |
+Measured with the included tool (`go run ./cmd/vaultdb-bench`), 128-dimension vectors, k = 10, cosine distance, M = 16, efConstruction = 200, on a 2-core machine. Raw numbers: [`docs/benchmark.csv`](docs/benchmark.csv).
 
-Random uniform vectors are the hardest case for HNSW; the gap grows with collection size and with real embeddings, which cluster.
+![Search time vs collection size](docs/search-time-vs-size.svg)
+
+| Vectors | Exact search | HNSW (efSearch 64) | Speed-up | Recall@10 |
+|---|---|---|---|---|
+| 10,000 | 1.60 ms | 172 µs | 9x | 100.0% |
+| 50,000 | 9.00 ms | 218 µs | 41x | 100.0% |
+| 100,000 | 35.69 ms | 439 µs | 81x | 99.5% |
+
+Exact search grows in step with the collection; HNSW barely grows, so the gap widens with size.
+
+![Recall vs speed](docs/recall-vs-speed.svg)
+
+**efSearch is a dial between speed and accuracy.** On clustered data (which behaves like real embeddings, where topics form groups) efSearch 64 already finds 99.5% of the true neighbours at 100,000 vectors.
+
+**The honest worst case:** on uniformly random 128-dimension vectors, recall is much lower (23.5% at efSearch 64, 55.5% at 256). In high dimensions, random points are all almost the same distance apart (the "curse of dimensionality"), so "nearest" barely means anything and no graph shortcut can find it reliably. Real embeddings are not like that, which is why approximate indexes work in practice. The benchmark includes both so the numbers are not cherry-picked.
 
 ## SQL
 
@@ -215,6 +226,8 @@ vaultdb/
   internal/btree/     sorted in-memory index: insert with splits, delete with borrow/merge, range walks
   internal/sql/       SQL lexer, recursive descent parser, AST, executor, result tables
   internal/vector/    vectors, cosine/L2 distance, flat index, HNSW index, collections
+  cmd/vaultdb-bench/  benchmark: exact vs HNSW speed and recall at several sizes, writes CSV
+  docs/               benchmark results and charts
   internal/server/    TCP server: goroutine per client, length-prefixed replies, limits, graceful shutdown
   internal/client/    Go client library for the protocol
   cmd/vaultdb-cli/    command-line client (interactive or one-shot with -c)
