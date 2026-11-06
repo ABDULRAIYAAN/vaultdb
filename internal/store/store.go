@@ -1,6 +1,7 @@
 // Package store holds VaultDB's key-value data.
 //
-// Reads are served from an in-memory map, so they never touch the disk.
+// Reads are served from an in-memory B-tree, so they never touch the disk,
+// and keys are always kept in sorted order for range and prefix queries.
 // Writes follow the write-ahead rule: the change is appended to the log on
 // disk first, and only then applied to the map. If the log write fails, the
 // map is left untouched, so memory never holds data the disk doesn't.
@@ -16,10 +17,11 @@ package store
 
 import (
 	"errors"
-	"sort"
+	"strings"
 	"sync"
 
 	"github.com/ABDULRAIYAAN/vaultdb/internal/aol"
+	"github.com/ABDULRAIYAAN/vaultdb/internal/btree"
 )
 
 // ErrNotFound is returned when a key does not exist.
@@ -53,8 +55,8 @@ func DefaultOptions() Options {
 // Store is a thread-safe key-value store, optionally backed by a log file.
 type Store struct {
 	mu   sync.RWMutex
-	data map[string]string
-	log  *aol.Log // nil for a purely in-memory store
+	data *btree.BTree // sorted key -> value
+	log  *aol.Log     // nil for a purely in-memory store
 	opts Options
 
 	// liveBytes is what the log would weigh if it held only current data:
@@ -67,7 +69,7 @@ type Store struct {
 
 // New creates an empty in-memory Store. Nothing is saved to disk.
 func New() *Store {
-	return &Store{data: make(map[string]string), liveBytes: int64(aol.FileHeaderSize)}
+	return &Store{data: btree.New(btree.DefaultDegree), liveBytes: int64(aol.FileHeaderSize)}
 }
 
 // OpenInfo describes what Open loaded from disk.
@@ -103,7 +105,7 @@ func Open(path string, opts Options) (*Store, OpenInfo, error) {
 	info := OpenInfo{
 		Path:          path,
 		Records:       res.Records,
-		Keys:          len(s.data),
+		Keys:          s.data.Len(),
 		TornBytes:     res.TornBytes,
 		RepairedBytes: res.RepairedBytes,
 	}
@@ -125,18 +127,18 @@ func Open(path string, opts Options) (*Store, OpenInfo, error) {
 func (s *Store) apply(r aol.Record) {
 	switch r.Op {
 	case aol.OpSet:
-		if old, ok := s.data[r.Key]; ok {
+		if old, ok := s.data.Get(r.Key); ok {
 			s.liveBytes -= aol.RecordSize(r.Key, old)
 		}
-		s.data[r.Key] = r.Value
+		s.data.Set(r.Key, r.Value)
 		s.liveBytes += aol.RecordSize(r.Key, r.Value)
 	case aol.OpDelete:
-		if old, ok := s.data[r.Key]; ok {
+		if old, ok := s.data.Get(r.Key); ok {
 			s.liveBytes -= aol.RecordSize(r.Key, old)
-			delete(s.data, r.Key)
+			s.data.Delete(r.Key)
 		}
 	case aol.OpClear:
-		s.data = make(map[string]string)
+		s.data.Clear()
 		s.liveBytes = int64(aol.FileHeaderSize)
 	}
 }
@@ -187,14 +189,15 @@ func (s *Store) Compact() (CompactResult, error) {
 // compactLocked does the rewrite. Caller holds s.mu, so no write can slip in
 // between taking the snapshot and swapping the files.
 func (s *Store) compactLocked() error {
-	keys := s.sortedKeysLocked() // sorted, so compacted files are deterministic
+	// The B-tree hands keys over in sorted order, so compacted files are
+	// always identical for identical data.
 	err := s.log.Rewrite(func(emit func(aol.Record) error) error {
-		for _, k := range keys {
-			if err := emit(aol.Record{Op: aol.OpSet, Key: k, Value: s.data[k]}); err != nil {
-				return err
-			}
-		}
-		return nil
+		var emitErr error
+		s.data.Ascend("", "", func(k, v string) bool {
+			emitErr = emit(aol.Record{Op: aol.OpSet, Key: k, Value: v})
+			return emitErr == nil
+		})
+		return emitErr
 	})
 	if err == nil {
 		s.compactions++
@@ -216,7 +219,7 @@ func (s *Store) Set(key, value string) error {
 func (s *Store) Get(key string) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	v, ok := s.data[key]
+	v, ok := s.data.Get(key)
 	if !ok {
 		return "", ErrNotFound
 	}
@@ -228,7 +231,7 @@ func (s *Store) Get(key string) (string, error) {
 func (s *Store) Delete(key string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.data[key]; !ok {
+	if _, ok := s.data.Get(key); !ok {
 		return false, nil
 	}
 	if err := s.write(aol.Record{Op: aol.OpDelete, Key: key}); err != nil {
@@ -241,7 +244,7 @@ func (s *Store) Delete(key string) (bool, error) {
 func (s *Store) Exists(key string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	_, ok := s.data[key]
+	_, ok := s.data.Get(key)
 	return ok
 }
 
@@ -249,23 +252,62 @@ func (s *Store) Exists(key string) bool {
 func (s *Store) Keys() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.sortedKeysLocked()
+	keys := make([]string, 0, s.data.Len())
+	s.data.Ascend("", "", func(k, _ string) bool {
+		keys = append(keys, k)
+		return true
+	})
+	return keys
 }
 
-func (s *Store) sortedKeysLocked() []string {
-	keys := make([]string, 0, len(s.data))
-	for k := range s.data {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+// KV is one key and its value.
+type KV struct {
+	Key, Value string
+}
+
+// Scan returns up to limit pairs with from <= key < to, in sorted order. An
+// empty from means "from the start", an empty to means "to the end", and a
+// limit of 0 or less means no limit. more reports whether pairs were left out
+// because of the limit.
+func (s *Store) Scan(from, to string, limit int) (pairs []KV, more bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	s.data.Ascend(from, to, func(k, v string) bool {
+		if limit > 0 && len(pairs) == limit {
+			more = true
+			return false
+		}
+		pairs = append(pairs, KV{k, v})
+		return true
+	})
+	return pairs, more
+}
+
+// Prefix returns up to limit pairs whose key starts with prefix, in sorted
+// order. All such keys sit next to each other in the B-tree, starting at
+// prefix itself, so the walk stops at the first key without the prefix.
+func (s *Store) Prefix(prefix string, limit int) (pairs []KV, more bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	s.data.Ascend(prefix, "", func(k, v string) bool {
+		if !strings.HasPrefix(k, prefix) {
+			return false
+		}
+		if limit > 0 && len(pairs) == limit {
+			more = true
+			return false
+		}
+		pairs = append(pairs, KV{k, v})
+		return true
+	})
+	return pairs, more
 }
 
 // Len returns the number of keys stored.
 func (s *Store) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.data)
+	return s.data.Len()
 }
 
 // Clear removes every key.
@@ -292,7 +334,7 @@ func (s *Store) Stats() Stats {
 	defer s.mu.RUnlock()
 	st := Stats{
 		Persistent:     s.log != nil,
-		Keys:           len(s.data),
+		Keys:           s.data.Len(),
 		Compactions:    s.compactions,
 		AutoCompact:    s.opts.AutoCompact,
 		LastCompactErr: s.lastCompactErr,

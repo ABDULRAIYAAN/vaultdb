@@ -86,3 +86,30 @@ func TestPersistentEngine(t *testing.T) {
 		t.Fatalf("COMPACT = %s", got)
 	}
 }
+
+func TestScanAndPrefix(t *testing.T) {
+	e := New(store.New())
+	for _, kv := range [][2]string{
+		{"user:1", "raiyaan"}, {"user:2", "ali"}, {"user:10", "sara"},
+		{"users", "x"}, {"order:1", "pizza"}, {"apple", "red"}, {"mango", "yellow"},
+	} {
+		run(t, e, "SET "+kv[0]+" "+kv[1])
+	}
+	cases := []struct{ in, want string }{
+		{`PREFIX user:`, "1) \"user:1\" => \"raiyaan\"\n2) \"user:10\" => \"sara\"\n3) \"user:2\" => \"ali\""},
+		{`PREFIX user: 2`, "1) \"user:1\" => \"raiyaan\"\n2) \"user:10\" => \"sara\"\n... more results (showing 2; add a bigger limit to see more)"},
+		{`PREFIX zzz`, `(empty)`},
+		{`SCAN a n`, "1) \"apple\" => \"red\"\n2) \"mango\" => \"yellow\""},
+		{`SCAN "" b`, "1) \"apple\" => \"red\""},
+		{`SCAN users ""`, "1) \"users\" => \"x\""},
+		{`SCAN "" "" 1`, "1) \"apple\" => \"red\"\n... more results (showing 1; add a bigger limit to see more)"},
+		{`SCAN a`, "(error) usage: SCAN <from> <to> [limit]   (use \"\" for no start or no end)"},
+		{`PREFIX user: 0`, `(error) limit must be a positive whole number, got "0"`},
+		{`PREFIX user: ten`, `(error) limit must be a positive whole number, got "ten"`},
+	}
+	for _, c := range cases {
+		if got := run(t, e, c.in); got != c.want {
+			t.Errorf("%s\n got: %s\nwant: %s", c.in, got, c.want)
+		}
+	}
+}

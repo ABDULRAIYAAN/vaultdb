@@ -6,7 +6,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.3.0: Milestone 3 complete.** Data is saved to a checksummed append-only log, survives restarts and crashes, detects corruption, and compacts itself so the file never grows without limit.
+**v0.4.0: Milestone 4 complete.** Keys live in a B-tree, so they are always sorted and range and prefix queries only touch matching keys. Data is saved to a checksummed append-only log that survives crashes and compacts itself.
 
 ## Quick start
 
@@ -17,7 +17,7 @@ go run ./cmd/vaultdb
 ```
 
 ```
-VaultDB 0.3.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.4.0. Type HELP for commands, EXIT to quit.
 Loaded 0 keys from data/vaultdb.log (0 log records).
 vaultdb> SET name raiyaan
 OK
@@ -30,7 +30,7 @@ Bye.
 Start it again and the data is still there:
 
 ```
-VaultDB 0.3.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.4.0. Type HELP for commands, EXIT to quit.
 Loaded 2 keys from data/vaultdb.log (2 log records).
 vaultdb> GET name
 "raiyaan"
@@ -61,6 +61,8 @@ go test -race ./...
 | `DEL <key>` | Delete a key. Returns 1 if it existed, 0 if not |
 | `EXISTS <key>` | 1 if the key exists, 0 if not |
 | `KEYS` | List every key, sorted |
+| `SCAN <from> <to> [limit]` | Keys from `<from>` up to (not including) `<to>`, sorted. `""` means no start or no end |
+| `PREFIX <prefix> [limit]` | Keys starting with `<prefix>`, sorted |
 | `COUNT` | Number of keys |
 | `CLEAR` | Delete everything |
 | `INFO` | Keys, log size, live data size, garbage percentage, compactions |
@@ -77,7 +79,7 @@ go test -race ./...
  +---------+  Command{Name, Args}  +---------+  Set/Get/Delete  +---------+  append   +----------------+
  | parser  | --------------------> | engine  | ---------------> |  store  | --------> | aol (log file) |
  +---------+                       +---------+                  +---------+           +----------------+
- splits text,                      checks arguments,            map in memory,        every change, in order,
+ splits text,                      checks arguments,            B-tree in memory,     every change, in order,
  handles "quotes"                  formats the reply            RWMutex               replayed on startup
 ```
 
@@ -86,7 +88,8 @@ vaultdb/
   cmd/vaultdb/        entry point: the interactive shell and command-line flags
   internal/parser/    turns a line of text into a command
   internal/engine/    runs commands, returns replies (reused by the TCP server later)
-  internal/store/     the data: in-memory map plus the write-ahead rule
+  internal/store/     the data: B-tree in memory, write-ahead rule, compaction
+  internal/btree/     sorted in-memory index: insert with splits, delete with borrow/merge, range walks
   internal/aol/       the log file: record format, checksums, append, replay, crash recovery, atomic rewrite
 ```
 
@@ -108,6 +111,21 @@ The file starts with a 9-byte header (`VAULTDB\0` plus a format version byte), f
 Length prefixes (instead of, say, one line of text per record) mean keys and values can contain any bytes, including spaces, newlines and quotes, without escaping.
 
 **Why two checksums?** With a single checksum over the whole record, a flipped bit in a length field would make the reader trust a wrong length before it could check anything. It could then read past the real end of the record, decide the file was cut off, and throw away every valid record after it. Verifying the small fixed-size header first means a length is only used once it is known to be correct.
+
+### How the B-tree index works
+
+Keys are kept in a **B-tree**, the structure behind the indexes in Postgres, MySQL and SQLite. Each node holds a sorted list of 31 to 63 keys, and a node with *n* keys has *n + 1* children holding the keys that fall between them:
+
+```
+                  [ g | p ]
+                 /    |    \
+        [a | c | e] [h | k] [q | t | x]
+```
+
+- **Lookup:** start at the root, binary-search inside the node, step into the right child. 100,000 keys need at most 4 levels (about 170 ns per lookup).
+- **Insert:** a full node is split in two on the way down and its middle key moves up. The tree only grows at the root, so every leaf stays at the same depth.
+- **Delete:** before stepping into a node with the minimum number of keys, it borrows a key from a sibling or merges with one, so no node is ever left too empty.
+- **Range scans:** `SCAN` and `PREFIX` jump straight to the first matching key and walk forward in order. A hash map would have to check every key.
 
 ### How compaction works
 
@@ -135,7 +153,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 1. In-memory key-value store and interactive shell
 - [x] 2. Persistence: append-only log, so data survives a restart
 - [x] 3. Crash recovery (checksums) and log compaction
-- [ ] 4. Indexing: hash index, then a B-tree for range queries
+- [x] 4. Indexing: B-tree for sorted keys, range and prefix queries
 - [ ] 5. A small SQL-like query language (`CREATE TABLE`, `INSERT`, `SELECT ... WHERE`)
 - [ ] 6. TCP server so multiple clients can connect
 - [ ] 7. Vector search: store embeddings, nearest-neighbour queries (brute force, then HNSW)

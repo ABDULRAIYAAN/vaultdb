@@ -101,3 +101,27 @@ func TestConcurrentAccess(t *testing.T) {
 		t.Fatalf("Len = %d, want 50", s.Len())
 	}
 }
+
+func TestScanPrefixAndLimits(t *testing.T) {
+	s := New()
+	for i := 0; i < 50; i++ {
+		s.Set(fmt.Sprintf("item:%02d", i), fmt.Sprint(i))
+	}
+	s.Set("other", "x")
+
+	pairs, more := s.Scan("item:10", "item:15", 0)
+	if len(pairs) != 5 || pairs[0].Key != "item:10" || pairs[4].Key != "item:14" || more {
+		t.Fatalf("Scan = %v, more=%v", pairs, more)
+	}
+	pairs, more = s.Prefix("item:", 10)
+	if len(pairs) != 10 || !more || pairs[9].Key != "item:09" {
+		t.Fatalf("Prefix with limit = %d pairs, more=%v", len(pairs), more)
+	}
+	pairs, more = s.Prefix("item:", 50)
+	if len(pairs) != 50 || more {
+		t.Fatalf("exact limit: %d pairs, more=%v", len(pairs), more)
+	}
+	if pairs, _ := s.Prefix("nothing", 0); len(pairs) != 0 {
+		t.Fatalf("Prefix(nothing) = %v", pairs)
+	}
+}

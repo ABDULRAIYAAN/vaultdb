@@ -19,7 +19,10 @@ const HelpText = `Commands:
   GET <key>           read a value
   DEL <key>           delete a key
   EXISTS <key>        1 if the key exists, 0 if not
-  KEYS                list every key
+  KEYS                list every key, sorted
+  SCAN <from> <to> [limit]   keys from <from> up to (not incl.) <to>;
+                             use "" for no start or no end
+  PREFIX <prefix> [limit]    keys starting with <prefix>
   COUNT               number of keys
   CLEAR               delete everything
   INFO                storage stats: keys, log size, garbage
@@ -98,6 +101,26 @@ func (e *Engine) Execute(cmd parser.Command) string {
 		}
 		return b.String()
 
+	case "SCAN":
+		if len(cmd.Args) != 2 && len(cmd.Args) != 3 {
+			return usage(`SCAN <from> <to> [limit]   (use "" for no start or no end)`)
+		}
+		limit, err := parseLimit(cmd.Args[2:])
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return formatPairs(e.store.Scan(cmd.Args[0], cmd.Args[1], limit))
+
+	case "PREFIX":
+		if len(cmd.Args) != 1 && len(cmd.Args) != 2 {
+			return usage("PREFIX <prefix> [limit]")
+		}
+		limit, err := parseLimit(cmd.Args[1:])
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return formatPairs(e.store.Prefix(cmd.Args[0], limit))
+
 	case "COUNT":
 		if len(cmd.Args) != 0 {
 			return usage("COUNT")
@@ -152,6 +175,37 @@ func (e *Engine) Execute(cmd parser.Command) string {
 	default:
 		return fmt.Sprintf("(error) unknown command %q, type HELP for the list", cmd.Name)
 	}
+}
+
+// DefaultLimit caps SCAN and PREFIX output when no limit is given.
+const DefaultLimit = 100
+
+func parseLimit(args []string) (int, error) {
+	if len(args) == 0 {
+		return DefaultLimit, nil
+	}
+	n, err := strconv.Atoi(args[0])
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("limit must be a positive whole number, got %q", args[0])
+	}
+	return n, nil
+}
+
+func formatPairs(pairs []store.KV, more bool) string {
+	if len(pairs) == 0 {
+		return "(empty)"
+	}
+	var b strings.Builder
+	for i, p := range pairs {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b, "%d) %s => %s", i+1, strconv.Quote(p.Key), strconv.Quote(p.Value))
+	}
+	if more {
+		fmt.Fprintf(&b, "\n... more results (showing %d; add a bigger limit to see more)", len(pairs))
+	}
+	return b.String()
 }
 
 func formatBytes(n int64) string {
