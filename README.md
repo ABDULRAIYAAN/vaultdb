@@ -145,20 +145,22 @@ Exact search grows in step with the collection; HNSW barely grows, so the gap wi
 
 ## The playground website
 
-`vaultdb-web` serves a website where anyone can try VaultDB in a browser: a live B-tree that splits as you insert keys, a terminal connected to a private VaultDB sandbox, an animated HNSW search, benchmark charts and a docs assistant.
+The website lets anyone try VaultDB with nothing to install: a live B-tree that splits as you insert keys, a terminal running a real VaultDB, an animated HNSW search, benchmark charts and a docs assistant.
+
+**The engine runs in the visitor's browser.** `cmd/vaultdb-wasm` compiles the same Go code (B-tree, SQL, HNSW, RAG search) to WebAssembly, and the page talks to it directly. So every visitor gets their own private database with no server behind it: nothing they type leaves their tab, there is nothing to overload, and the whole site is static files that any host can serve. It is hosted on Vercel with the settings in `vercel.json`.
 
 ```bash
-go run ./cmd/vaultdb-web          # then open http://localhost:8080
+cd web
+npm install
+npm run wasm     # compile the engine to web/src/vaultdb.wasm (needs Go)
+npm run build    # bundle everything into web/dist
 ```
 
-On Windows, double-click `web.bat`.
+To try it locally, run `go run ./cmd/vaultdb-web` (or double-click `web.bat` on Windows) and open http://localhost:8080. That server can also run the older server-side playground and a docs assistant backed by a real AI model; [`deploy/DEPLOY.md`](deploy/DEPLOY.md) shows how to put it on your own Linux server.
 
-To put it online, see [`deploy/DEPLOY.md`](deploy/DEPLOY.md): one script sets up an Oracle Cloud free-tier server with Caddy for automatic HTTPS and a hardened systemd service.
-
-- **Every visitor gets a private, in-memory database**, deleted after 30 minutes idle, capped at 1 MB. Nobody can see anyone else's data.
-- **Hardened for the public internet:** per-IP rate limits, 4 KB commands, 16 KB request bodies, server timeouts, a strict Content-Security-Policy (no inline scripts or styles, no third-party requests), `nosniff`, `frame-ancestors 'none'`, HSTS on HTTPS, and random `HttpOnly`, `SameSite=Strict` cookies. A daily cap protects any paid AI key behind the docs assistant.
-- **One binary.** The front end is built into the server with `go:embed`, so deploying means copying one file.
-- **Front end:** plain JavaScript with [Motion](https://motion.dev) for animation and CSS 3D transforms (a tilted B-tree card, and HNSW layers stacked in 3D space that a search drops through), bundled by esbuild into about 220 KB including self-hosted fonts. Buttons use a frosted "liquid glass" style. The B-tree drawing uses the same insert-and-split rules as the Go code. Animations respect `prefers-reduced-motion`, and glass falls back to solid with `prefers-reduced-transparency`. Source in `web/src`; rebuild with `cd web && npm install && npm run build`.
+- **WebAssembly build:** about 5 MB, 1.4 MB compressed, cached forever under a content-hashed name. The network code for the AI providers is left out of the browser build with a `!js` build tag, and the docs assistant searches the README and source code embedded in the binary with the local embedder, so no API key ever reaches the page.
+- **Locked down:** a strict Content-Security-Policy (no inline scripts or styles, no third-party requests; `'wasm-unsafe-eval'` is the only addition, which lets the page compile WebAssembly), HSTS, `nosniff`, `frame-ancestors 'none'`, no cookies and no analytics. A size cap empties the database before it can eat the tab's memory.
+- **Front end:** plain JavaScript with [Motion](https://motion.dev) for animation and CSS 3D transforms (a tilted B-tree card, and HNSW layers stacked in 3D space that a search drops through), bundled by esbuild into about 220 KB including self-hosted fonts. Buttons use a frosted "liquid glass" style. The B-tree drawing uses the same insert-and-split rules as the Go code. Animations respect `prefers-reduced-motion`, and glass falls back to solid with `prefers-reduced-transparency`.
 
 ## Chat with your documents (RAG)
 
@@ -306,8 +308,10 @@ vaultdb/
   cmd/vaultdb-chat/   chat-with-your-documents command
   internal/web/       playground server: sandboxes, rate limits, security headers, JSON API
   cmd/vaultdb-web/    runs the playground website
-  web/                the website: src/ (HTML, CSS, JS), dist/ (built, embedded into the binary)
-  deploy/             Oracle Cloud setup script, systemd service, Caddy config, step-by-step guide
+  cmd/vaultdb-wasm/   the engine compiled to WebAssembly for the website
+  web/                the website: src/ (HTML, CSS, JS), dist/ (built, what gets hosted)
+  vercel.json         hosting settings: output folder, security headers, caching
+  deploy/             self-hosting on a Linux server: setup script, systemd service, Caddy config
   internal/server/    TCP server: goroutine per client, length-prefixed replies, limits, graceful shutdown
   internal/client/    Go client library for the protocol
   cmd/vaultdb-cli/    command-line client (interactive or one-shot with -c)
@@ -379,7 +383,8 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 6. TCP server so multiple clients can connect
 - [x] 7. Vector search: store embeddings, nearest-neighbour queries (brute force, then HNSW), RAG chat with any AI provider
 - [x] 8a. Benchmarks, playground website
-- [ ] 8b. Deploy online with a custom domain, v1.0 release
+- [x] 8b. Engine compiled to WebAssembly, site hosted on Vercel
+- [ ] 8c. Custom domain, v1.0 release
 
 ## Author
 

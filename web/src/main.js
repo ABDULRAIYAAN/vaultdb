@@ -2,6 +2,7 @@ import "./style.css";
 import { animate } from "motion";
 import { createTreeViz } from "./btree-viz.js";
 import { createHnswViz } from "./hnsw-viz.js";
+import "./wasm_exec.js";
 
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const $ = (id) => document.getElementById(id);
@@ -41,6 +42,25 @@ addEventListener("resize", () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => tree.relayout(), 150);
 });
+
+// ---------- The engine ----------
+// VaultDB itself, compiled from Go to WebAssembly, runs inside this tab.
+// Nothing typed in the playground is sent anywhere.
+const engine = (async () => {
+  const go = new Go();
+  const ready = new Promise((resolve) => addEventListener("vaultdb-ready", resolve, { once: true }));
+  let result;
+  try {
+    result = await WebAssembly.instantiateStreaming(fetch(__WASM_URL__), go.importObject);
+  } catch {
+    // Some hosts send the wrong content type; fall back to a plain download.
+    const bytes = await (await fetch(__WASM_URL__)).arrayBuffer();
+    result = await WebAssembly.instantiate(bytes, go.importObject);
+  }
+  go.run(result.instance);
+  await ready;
+  return globalThis.vaultdb;
+})();
 
 // ---------- Playground ----------
 const out = $("term-out");
@@ -87,29 +107,17 @@ async function run(cmd) {
   history.push(cmd);
   histPos = history.length;
   try {
-    const res = await fetch("/api/exec", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command: cmd }),
-    });
-    const data = await res.json();
-    if (data.error) {
-      print(cmd, data.error, true);
-    } else {
-      print(cmd, data.reply, data.reply.startsWith("(error)"));
-      setStat("st-keys", data.keys);
-      setStat("st-bytes", data.bytes, formatBytes);
-      $("st-time").textContent = data.micros < 1 ? "under 1 µs" : `${data.micros} µs`;
-    }
+    const data = (await engine).exec(cmd);
+    print(cmd, data.reply, data.reply.startsWith("(error)"));
+    setStat("st-keys", data.keys);
+    setStat("st-bytes", data.bytes, formatBytes);
+    $("st-time").textContent = data.micros < 1 ? "under 1 µs" : `${data.micros} µs`;
   } catch {
-    print(cmd, "Could not reach the server. Check your connection and try again.", true);
+    print(cmd, "VaultDB could not start in this browser. Try reloading the page.", true);
   } finally {
     busy = false;
-    clearTimeout(statsTimer);
-    statsTimer = setTimeout(refreshServerLine, 800);
   }
 }
-let statsTimer;
 
 $("term-form").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -182,31 +190,27 @@ for (const ex of examples) {
 
 $("term-reset").addEventListener("click", async () => {
   try {
-    const res = await fetch("/api/reset", { method: "POST" });
-    const data = await res.json();
-    print("(empty my sandbox)", data.reply || data.error, Boolean(data.error));
-    if (!data.error) {
-      setStat("st-keys", 0);
-      setStat("st-bytes", 0, formatBytes);
-    }
+    const data = (await engine).reset();
+    print("(empty my database)", data.reply, false);
+    setStat("st-keys", 0);
+    setStat("st-bytes", 0, formatBytes);
   } catch {
-    print("(empty my sandbox)", "Could not reach the server.", true);
+    print("(empty my database)", "VaultDB could not start in this browser. Try reloading the page.", true);
   }
 });
 
-// Real numbers about this server, nothing invented.
-function refreshServerLine() {
-  fetch("/api/stats")
-    .then((r) => r.json())
-    .then((s) => {
-      const n = s.commandsServed.toLocaleString("en");
-      const up = s.uptimeSeconds >= 3600 ? `${Math.floor(s.uptimeSeconds / 3600)} h` : `${Math.max(1, Math.floor(s.uptimeSeconds / 60))} min`;
-      $("server-line").textContent = `This server has answered ${n} ${s.commandsServed === 1 ? "command" : "commands"} since it started ${up} ago.`;
-      if (!s.askEnabled) $("ask").hidden = true;
-    })
-    .catch(() => {});
-}
-refreshServerLine();
+// Say when the engine is ready, and how big it is. Real numbers only.
+engine.then(
+  () => {
+    const kb = performance.getEntriesByType("resource").find((r) => r.name.includes(".wasm"))?.transferSize;
+    $("term-status").textContent = "VaultDB is running in this tab. Try HELP.";
+    $("server-line").textContent = `The engine is the real Go code compiled to WebAssembly${kb ? ` (${(kb / 1048576).toFixed(1)} MB download)` : ""}. Nothing you type leaves this tab.`;
+    input.disabled = false;
+  },
+  () => {
+    $("term-status").textContent = "VaultDB could not start in this browser. Try reloading, or a newer browser.";
+  }
+);
 
 // ---------- HNSW drawing ----------
 const hnsw = createHnswViz($("hnsw"), reduceMotion);
@@ -223,12 +227,7 @@ $("ask-form").addEventListener("submit", async (e) => {
   button.disabled = true;
   box.replaceChildren(Object.assign(document.createElement("p"), { className: "ask-hint", textContent: "Searching VaultDB's docs..." }));
   try {
-    const res = await fetch("/api/ask", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question: q }),
-    });
-    const data = await res.json();
+    const data = (await engine).ask(q);
     box.replaceChildren();
     if (data.error) {
       box.appendChild(Object.assign(document.createElement("p"), { className: "ask-error", textContent: data.error }));
@@ -255,7 +254,7 @@ $("ask-form").addEventListener("submit", async (e) => {
     });
     box.appendChild(list);
   } catch {
-    box.replaceChildren(Object.assign(document.createElement("p"), { className: "ask-error", textContent: "Could not reach the server. Check your connection and try again." }));
+    box.replaceChildren(Object.assign(document.createElement("p"), { className: "ask-error", textContent: "VaultDB could not start in this browser. Try reloading the page." }));
   } finally {
     button.disabled = false;
   }

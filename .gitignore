@@ -27,3 +27,4 @@ vaultdb-chat.env
 # Front-end build inputs (dist/ is committed so Go users don't need Node)
 web/node_modules/
 web/src/fonts/
+web/src/vaultdb.wasm

@@ -57,22 +57,22 @@
   <section id="playground" class="section" aria-labelledby="pg-title">
     <div class="section-head">
       <h2 id="pg-title">Playground</h2>
-      <p>You have your own private database for the next 30 minutes. Type a command, or pick an example.</p>
+      <p>The real engine runs right here in your browser, so the database is yours alone. Type a command, or pick an example.</p>
     </div>
 
     <div class="pg">
       <div class="terminal" id="terminal">
         <div class="term-out" id="term-out" aria-live="polite">
-          <p class="term-note">Connected to a fresh VaultDB sandbox. Try <code>HELP</code>.</p>
+          <p class="term-note" id="term-status">Starting VaultDB in your browser...</p>
         </div>
         <form class="term-in" id="term-form" autocomplete="off">
           <label for="term-input" class="prompt">vaultdb&gt;</label>
-          <input id="term-input" spellcheck="false" autocapitalize="off" aria-label="Command">
+          <input id="term-input" disabled spellcheck="false" autocapitalize="off" aria-label="Command">
         </form>
       </div>
 
-      <aside class="pg-side" aria-label="Sandbox details">
-        <h3>Your sandbox</h3>
+      <aside class="pg-side" aria-label="Database details">
+        <h3>Your database</h3>
         <dl class="stats">
           <div><dt>Keys</dt><dd id="st-keys">0</dd></div>
           <div><dt>Data</dt><dd id="st-bytes">0 B</dd></div>
@@ -80,7 +80,7 @@
         </dl>
         <h3>Examples</h3>
         <div class="examples" id="examples"></div>
-        <button class="btn small quiet" type="button" id="term-reset">Empty my sandbox</button>
+        <button class="btn small quiet" type="button" id="term-reset">Empty my database</button>
         <p class="server-line" id="server-line"></p>
       </aside>
     </div>

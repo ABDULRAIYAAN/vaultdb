@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "wasm": "node build-wasm.mjs",
     "build": "node build.mjs"
   },
   "devDependencies": {

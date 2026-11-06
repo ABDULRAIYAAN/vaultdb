@@ -110,7 +110,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 	h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
 	h.Set("Cross-Origin-Opener-Policy", "same-origin")
-	h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+	h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 	if s.opts.SecureCookies {
 		h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 	}

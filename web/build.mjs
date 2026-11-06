@@ -4,8 +4,11 @@
 //   - copies the HTML pages, pointing them at the hashed files
 //   - copies images and public files as they are
 //
-// Usage: npm install && npm run build
+//   - copies the engine compiled to WebAssembly (src/vaultdb.wasm)
+//
+// Usage: npm install && npm run wasm && npm run build
 // NODE_DEPS can point at a node_modules folder elsewhere.
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -30,6 +33,13 @@ for (const [name, from] of Object.entries(fonts)) {
 }
 
 rmSync(dist, { recursive: true, force: true });
+
+// The engine itself, compiled from Go (see the "wasm" script in package.json).
+// It gets a content hash like the other assets so it can be cached forever.
+const wasm = readFileSync(join(src, "vaultdb.wasm"));
+const wasmName = `vaultdb-${createHash("sha256").update(wasm).digest("hex").slice(0, 10)}.wasm`;
+mkdirSync(join(dist, "assets"), { recursive: true });
+writeFileSync(join(dist, "assets", wasmName), wasm);
 const result = await esbuild.build({
   entryPoints: { app: join(src, "main.js") },
   bundle: true,
@@ -43,6 +53,7 @@ const result = await esbuild.build({
   nodePaths: [deps],
   metafile: true,
   legalComments: "none",
+  define: { __WASM_URL__: JSON.stringify(`/assets/${wasmName}`) },
 });
 
 const outputs = Object.keys(result.metafile.outputs).map((p) => p.split("/assets/")[1]);
@@ -60,4 +71,4 @@ if (existsSync(join(src, "public"))) cpSync(join(src, "public"), dist, { recursi
 
 let total = 0;
 for (const [file, info] of Object.entries(result.metafile.outputs)) total += info.bytes;
-console.log(`built ${js}, ${css} and fonts: ${(total / 1024).toFixed(0)} KB total`);
+console.log(`built ${js}, ${css} and fonts: ${(total / 1024).toFixed(0)} KB total, plus ${wasmName}: ${(wasm.length / 1024).toFixed(0)} KB`);
