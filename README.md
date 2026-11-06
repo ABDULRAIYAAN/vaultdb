@@ -6,7 +6,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.7.0: vector search with HNSW.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -17,7 +17,7 @@ go run ./cmd/vaultdb
 ```
 
 ```
-VaultDB 0.7.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.8.0. Type HELP for commands, EXIT to quit.
 Loaded 0 keys from data/vaultdb.log (0 log records).
 vaultdb> SET name raiyaan
 OK
@@ -30,7 +30,7 @@ Bye.
 Start it again and the data is still there:
 
 ```
-VaultDB 0.7.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.8.0. Type HELP for commands, EXIT to quit.
 Loaded 2 keys from data/vaultdb.log (2 log records).
 vaultdb> GET name
 "raiyaan"
@@ -143,6 +143,62 @@ Exact search grows in step with the collection; HNSW barely grows, so the gap wi
 
 **The honest worst case:** on uniformly random 128-dimension vectors, recall is much lower (23.5% at efSearch 64, 55.5% at 256). In high dimensions, random points are all almost the same distance apart (the "curse of dimensionality"), so "nearest" barely means anything and no graph shortcut can find it reliably. Real embeddings are not like that, which is why approximate indexes work in practice. The benchmark includes both so the numbers are not cherry-picked.
 
+## Chat with your documents (RAG)
+
+`vaultdb-chat` uses VaultDB as the memory of an AI assistant. It reads a folder of notes or code, stores every chunk as a vector, and answers questions using only the passages it finds, citing them:
+
+```
+INGEST (once)                          ASK (every question)
+folder of .md / .txt files             "What does the report say about X?"
+        |                                       |
+   split into chunks                       embed the question
+        |                                       |
+   embed each chunk  ---> VaultDB <---  VSEARCH: nearest chunks (HNSW)
+                                                |
+                                        question + best chunks -> chat model
+                                                |
+                                        answer that cites [1], [2] ...
+```
+
+```bash
+go run ./cmd/vaultdb-chat providers                         # see every option
+go run ./cmd/vaultdb-chat ingest ./notes -embed ollama      # read a folder
+go run ./cmd/vaultdb-chat chat -embed ollama -llm ollama    # talk to it
+go run ./cmd/vaultdb-chat ask -embed ollama -llm groq "What are the main risks?"
+```
+
+On Windows: copy `vaultdb-chat.env.example` to `vaultdb-chat.env`, pick your providers and keys there, then run `chat.bat ingest <folder>` once and double-click `chat.bat`.
+
+### Any model, your choice
+
+Embeddings and answers are chosen separately, so you can mix them (for example free local embeddings with a fast cloud model):
+
+| Provider | Answers | Embeddings | Needs |
+|---|---|---|---|
+| `local` | | built-in word hashing | nothing (instant demo) |
+| `ollama` | llama3.2 | nomic-embed-text | [Ollama](https://ollama.com) on your computer, free |
+| `lmstudio` | any loaded model | any loaded model | [LM Studio](https://lmstudio.ai) on your computer, free |
+| `gemini` | gemini-flash-latest | gemini-embedding-001 | `GEMINI_API_KEY` (free tier) |
+| `groq` | llama-3.3-70b-versatile | | `GROQ_API_KEY` (free tier) |
+| `openai` | gpt-5-mini | text-embedding-3-small | `OPENAI_API_KEY` |
+| `anthropic` | claude-haiku-5-5 | | `ANTHROPIC_API_KEY` |
+| `mistral` | mistral-small-latest | mistral-embed | `MISTRAL_API_KEY` |
+| `openrouter` | openrouter/auto | | `OPENROUTER_API_KEY` |
+| `voyage` | | voyage-3.5 | `VOYAGE_API_KEY` |
+| `jina` | | jina-embeddings-v3 | `JINA_API_KEY` |
+| `none` | shows the matching passages only | | nothing |
+
+Any model a provider offers can be picked with `-model` / `-embed-model`, and `-llm-url` / `-embed-url` point at any other OpenAI-compatible server.
+
+### How it's built
+
+- **Three adapters cover eleven providers.** Most services speak the OpenAI-compatible API, so one adapter handles OpenAI, Groq, Mistral, OpenRouter, Voyage, Jina, Ollama and LM Studio by changing only the URL. Gemini and Anthropic have their own formats and their own adapters. No SDKs: plain HTTP and JSON from the Go standard library.
+- **Chunking** splits text at about 1,000 characters, preferring paragraph ends, then sentence ends, then spaces, with 150 characters of overlap so a sentence cut at a boundary is still whole in one chunk.
+- **Incremental ingest.** Each file's SHA-256 is stored, so re-running only re-embeds changed files and removes chunks of deleted ones.
+- **Models are never mixed.** A collection remembers which embedding model built it; vectors from two models live in unrelated spaces, so asking with a different one is refused with a clear message.
+- **Grounded answers.** The model receives numbered passages and is told to answer only from them and cite them, or say it could not find the answer.
+- **Keys stay private:** read from environment variables or a git-ignored `vaultdb-chat.env`, and stripped from error messages.
+
 ## SQL
 
 ```
@@ -228,6 +284,9 @@ vaultdb/
   internal/vector/    vectors, cosine/L2 distance, flat index, HNSW index, collections
   cmd/vaultdb-bench/  benchmark: exact vs HNSW speed and recall at several sizes, writes CSV
   docs/               benchmark results and charts
+  internal/ai/        AI providers: OpenAI-compatible, Gemini, Anthropic adapters and a local embedder
+  internal/rag/       document chunking, incremental ingest, retrieval and grounded answers
+  cmd/vaultdb-chat/   chat-with-your-documents command
   internal/server/    TCP server: goroutine per client, length-prefixed replies, limits, graceful shutdown
   internal/client/    Go client library for the protocol
   cmd/vaultdb-cli/    command-line client (interactive or one-shot with -c)
@@ -297,7 +356,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 4. Indexing: B-tree for sorted keys, range and prefix queries
 - [x] 5. A small SQL-like query language (`CREATE TABLE`, `INSERT`, `SELECT ... WHERE`, `UPDATE`, `DELETE`)
 - [x] 6. TCP server so multiple clients can connect
-- [ ] 7. Vector search: store embeddings, nearest-neighbour queries (brute force, then HNSW)
+- [x] 7. Vector search: store embeddings, nearest-neighbour queries (brute force, then HNSW), RAG chat with any AI provider
 - [ ] 8. Benchmarks
 
 ## Author

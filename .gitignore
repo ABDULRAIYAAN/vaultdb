@@ -19,3 +19,7 @@ Thumbs.db
 /fix.bat
 /publish.bat
 *.bundle
+
+# AI provider keys (never commit these)
+vaultdb-chat.env
+*.env

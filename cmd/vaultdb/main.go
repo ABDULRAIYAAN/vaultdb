@@ -34,7 +34,7 @@ import (
 	"github.com/ABDULRAIYAAN/vaultdb/internal/store"
 )
 
-const version = "0.7.0"
+const version = "0.8.0"
 
 func main() {
 	dataPath := flag.String("data", filepath.Join("data", "vaultdb.log"), "log file to store data in")
