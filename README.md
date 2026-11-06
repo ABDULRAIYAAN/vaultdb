@@ -2,6 +2,8 @@
 
 A database built from scratch in Go, one layer at a time: an in-memory key-value store first, then disk persistence, indexing, a query language, a network server and vector search.
 
+**Try it live: [vaultdb-raiyaan.vercel.app](https://vaultdb-raiyaan.vercel.app)**. The real engine, compiled to WebAssembly, runs in your browser.
+
 The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB, pgvector) work on the inside by building the same ideas by hand.
 
 ## Status
