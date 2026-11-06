@@ -12,6 +12,7 @@ import (
 	"github.com/ABDULRAIYAAN/vaultdb/internal/parser"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/sql"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/store"
+	"github.com/ABDULRAIYAAN/vaultdb/internal/vector"
 )
 
 // HelpText lists every supported command.
@@ -31,6 +32,12 @@ const HelpText = `Commands:
   HELP                show this list
   EXIT                quit
 
+VECTORS (similarity search, stored as keys under vec:):
+  VCREATE <coll> <dim> [COSINE|L2]      new collection, e.g. VCREATE docs 384
+  VADD <coll> <id> <vector> [text]      VADD docs n1 "[0.1, 0.9, 0.3]" "some text"
+  VSEARCH <coll> <vector> [k]           the k nearest vectors (default 5)
+  VGET <coll> <id>  |  VDEL <coll> <id>  |  VDROP <coll>  |  VCOLLECTIONS
+
 SQL (tables are stored as keys under sql:):
   CREATE TABLE students (id INT PRIMARY KEY, name TEXT, gpa FLOAT, active BOOL)
   INSERT INTO students VALUES (1, 'Ali', 3.5, TRUE), (2, 'Sara', 3.8, FALSE)
@@ -44,11 +51,12 @@ SQL (tables are stored as keys under sql:):
 type Engine struct {
 	store *store.Store
 	sql   *sql.Executor
+	vec   *vector.Manager
 }
 
 // New creates an Engine backed by s.
 func New(s *store.Store) *Engine {
-	return &Engine{store: s, sql: sql.NewExecutor(s)}
+	return &Engine{store: s, sql: sql.NewExecutor(s), vec: vector.NewManager(s)}
 }
 
 var sqlStarts = map[string]bool{
@@ -76,8 +84,30 @@ func (e *Engine) ExecuteLine(line string) string {
 	return e.Execute(cmd)
 }
 
+// Keys under these prefixes belong to SQL tables and vector collections.
+// Changing them with plain SET or DEL would leave those features out of
+// step with the store, so it is refused.
+var managedPrefixes = []string{"sql:", "vec:"}
+
+func managed(key string) bool {
+	for _, p := range managedPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // Execute runs cmd and returns the text to show the user.
 func (e *Engine) Execute(cmd parser.Command) string {
+	if (cmd.Name == "SET" || cmd.Name == "DEL") && len(cmd.Args) > 0 && managed(cmd.Args[0]) {
+		return "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
+	}
+	if strings.HasPrefix(cmd.Name, "V") {
+		if reply, ok := e.vectorCommand(cmd); ok {
+			return reply
+		}
+	}
 	switch cmd.Name {
 	case "SET":
 		if len(cmd.Args) != 2 {
@@ -170,6 +200,7 @@ func (e *Engine) Execute(cmd parser.Command) string {
 		if err := e.store.Clear(); err != nil {
 			return "(error) " + err.Error()
 		}
+		e.vec.Reset() // collections were just deleted from the store
 		return "OK"
 
 	case "INFO":
@@ -211,6 +242,137 @@ func (e *Engine) Execute(cmd parser.Command) string {
 	default:
 		return fmt.Sprintf("(error) unknown command %q, type HELP for the list", cmd.Name)
 	}
+}
+
+// vectorCommand runs V... commands. ok is false if cmd is not one of them.
+func (e *Engine) vectorCommand(cmd parser.Command) (reply string, ok bool) {
+	a := cmd.Args
+	fail := func(err error) (string, bool) { return "(error) " + err.Error(), true }
+	switch cmd.Name {
+	case "VCREATE":
+		if len(a) != 2 && len(a) != 3 {
+			return usage("VCREATE <collection> <dimensions> [COSINE|L2]"), true
+		}
+		dim, err := strconv.Atoi(a[1])
+		if err != nil {
+			return "(error) dimensions must be a whole number", true
+		}
+		metric := vector.Cosine
+		if len(a) == 3 {
+			if metric, err = vector.ParseMetric(a[2]); err != nil {
+				return fail(err)
+			}
+		}
+		if err := e.vec.Create(a[0], dim, metric); err != nil {
+			return fail(err)
+		}
+		return fmt.Sprintf("OK, collection %s created (%d dimensions, %s)", a[0], dim, metric), true
+
+	case "VDROP":
+		if len(a) != 1 {
+			return usage("VDROP <collection>"), true
+		}
+		n, err := e.vec.Drop(a[0])
+		if err != nil {
+			return fail(err)
+		}
+		return fmt.Sprintf("OK, collection %s dropped (%d vectors deleted)", a[0], n), true
+
+	case "VADD":
+		if len(a) != 3 && len(a) != 4 {
+			return usage(`VADD <collection> <id> "[n1, n2, ...]" ["text"]`), true
+		}
+		v, err := vector.Parse(a[2])
+		if err != nil {
+			return fail(err)
+		}
+		text := ""
+		if len(a) == 4 {
+			text = a[3]
+		}
+		isNew, err := e.vec.Add(a[0], a[1], v, text)
+		if err != nil {
+			return fail(err)
+		}
+		if isNew {
+			return "(integer) 1", true
+		}
+		return "(integer) 0", true
+
+	case "VGET":
+		if len(a) != 2 {
+			return usage("VGET <collection> <id>"), true
+		}
+		v, text, err := e.vec.Get(a[0], a[1])
+		if err != nil {
+			return fail(err)
+		}
+		return fmt.Sprintf("vector: %s\ntext: %s", v, strconv.Quote(text)), true
+
+	case "VDEL":
+		if len(a) != 2 {
+			return usage("VDEL <collection> <id>"), true
+		}
+		existed, err := e.vec.Delete(a[0], a[1])
+		if err != nil {
+			return fail(err)
+		}
+		if existed {
+			return "(integer) 1", true
+		}
+		return "(integer) 0", true
+
+	case "VSEARCH":
+		if len(a) != 2 && len(a) != 3 {
+			return usage(`VSEARCH <collection> "[n1, n2, ...]" [k]`), true
+		}
+		q, err := vector.Parse(a[1])
+		if err != nil {
+			return fail(err)
+		}
+		k := 5
+		if len(a) == 3 {
+			if k, err = strconv.Atoi(a[2]); err != nil || k < 1 {
+				return "(error) k must be a positive whole number", true
+			}
+		}
+		hits, err := e.vec.Search(a[0], q, k)
+		if err != nil {
+			return fail(err)
+		}
+		if len(hits) == 0 {
+			return "(empty)", true
+		}
+		var b strings.Builder
+		for i, h := range hits {
+			if i > 0 {
+				b.WriteByte('\n')
+			}
+			fmt.Fprintf(&b, "%d) %s  distance %.4f", i+1, strconv.Quote(h.ID), h.Distance)
+			if h.Payload != "" {
+				fmt.Fprintf(&b, "  %s", strconv.Quote(h.Payload))
+			}
+		}
+		return b.String(), true
+
+	case "VCOLLECTIONS":
+		list, err := e.vec.List()
+		if err != nil {
+			return fail(err)
+		}
+		if len(list) == 0 {
+			return "(empty)", true
+		}
+		var b strings.Builder
+		for i, c := range list {
+			if i > 0 {
+				b.WriteByte('\n')
+			}
+			fmt.Fprintf(&b, "%d) %s  %d dims, %s, %d vectors", i+1, c.Name, c.Dim, c.Metric, c.Count)
+		}
+		return b.String(), true
+	}
+	return "", false
 }
 
 // DefaultLimit caps SCAN and PREFIX output when no limit is given.

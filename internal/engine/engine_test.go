@@ -131,3 +131,32 @@ func TestExecuteLineRoutesSQL(t *testing.T) {
 		}
 	}
 }
+
+func TestVectorCommands(t *testing.T) {
+	e := New(store.New())
+	steps := []struct{ in, want string }{
+		{`VCREATE docs 3`, "OK, collection docs created (3 dimensions, COSINE)"},
+		{`VADD docs car "[1, 0, 0]" "The car broke down"`, "(integer) 1"},
+		{`VADD docs vehicle "[0.9, 0.1, 0]" "My vehicle stopped working"`, "(integer) 1"},
+		{`VADD docs cake "[0, 0, 1]" "I love chocolate cake"`, "(integer) 1"},
+		{`VADD docs cake "[0, 0.1, 1]" "I love chocolate cake"`, "(integer) 0"},
+		{`VSEARCH docs "[1, 0.05, 0]" 2`, "1) \"car\"  distance 0.0012  \"The car broke down\"\n2) \"vehicle\"  distance 0.0018  \"My vehicle stopped working\""},
+		{`VGET docs car`, "vector: [1, 0, 0]\ntext: \"The car broke down\""},
+		{`VCOLLECTIONS`, "1) docs  3 dims, COSINE, 3 vectors"},
+		{`VDEL docs cake`, "(integer) 1"},
+		{`VADD docs x "[1, 2]"`, "(error) collection docs holds 3-dimensional vectors, got 2 numbers"},
+		{`VSEARCH nope "[1]"`, "(error) vector collection nope does not exist (create it with VCREATE)"},
+		{`VCREATE bad 3 MANHATTAN`, "(error) unknown metric \"MANHATTAN\" (use COSINE or L2)"},
+		{`SET vec:item:docs:car hacked`, "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"},
+		{`DEL sql:schema:t`, "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"},
+		{`VDROP docs`, "OK, collection docs dropped (2 vectors deleted)"},
+		{`VCREATE docs 2`, "OK, collection docs created (2 dimensions, COSINE)"},
+		{`CLEAR`, "OK"},
+		{`VCOLLECTIONS`, "(empty)"},
+	}
+	for _, s := range steps {
+		if got := e.ExecuteLine(s.in); got != s.want {
+			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
+	}
+}
