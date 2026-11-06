@@ -22,7 +22,8 @@ const HelpText = `Commands:
   KEYS                list every key
   COUNT               number of keys
   CLEAR               delete everything
-  INFO                storage mode, key count, log size
+  INFO                storage stats: keys, log size, garbage
+  COMPACT             rewrite the log with only current data
   HELP                show this list
   EXIT                quit`
 
@@ -116,12 +117,34 @@ func (e *Engine) Execute(cmd parser.Command) string {
 		if len(cmd.Args) != 0 {
 			return usage("INFO")
 		}
-		mode := "in-memory (nothing saved)"
-		if e.store.Persistent() {
-			mode = "persistent (append-only log)"
+		st := e.store.Stats()
+		if !st.Persistent {
+			return fmt.Sprintf("mode: in-memory (nothing saved)\nkeys: %d", st.Keys)
 		}
-		return fmt.Sprintf("mode: %s\nkeys: %d\nlog size: %s",
-			mode, e.store.Len(), formatBytes(e.store.LogSize()))
+		garbage := 0.0
+		if st.LogBytes > 0 {
+			garbage = 100 * float64(st.LogBytes-st.LiveBytes) / float64(st.LogBytes)
+		}
+		auto := "on"
+		if !st.AutoCompact {
+			auto = "off"
+		}
+		out := fmt.Sprintf("mode: persistent (append-only log)\nkeys: %d\nlog size: %s\nlive data: %s\ngarbage: %.0f%%\nauto-compaction: %s\ncompactions this session: %d",
+			st.Keys, formatBytes(st.LogBytes), formatBytes(st.LiveBytes), garbage, auto, st.Compactions)
+		if st.LastCompactErr != nil {
+			out += "\nlast compaction error: " + st.LastCompactErr.Error()
+		}
+		return out
+
+	case "COMPACT":
+		if len(cmd.Args) != 0 {
+			return usage("COMPACT")
+		}
+		res, err := e.store.Compact()
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return fmt.Sprintf("OK, log shrank from %s to %s", formatBytes(res.BytesBefore), formatBytes(res.BytesAfter))
 
 	case "HELP":
 		return HelpText

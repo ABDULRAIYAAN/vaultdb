@@ -33,7 +33,8 @@ func TestSession(t *testing.T) {
 		{`EXISTS name`, `(integer) 0`},
 		{`CLEAR`, `OK`},
 		{`KEYS`, `(empty)`},
-		{`INFO`, "mode: in-memory (nothing saved)\nkeys: 0\nlog size: 0 bytes"},
+		{`INFO`, "mode: in-memory (nothing saved)\nkeys: 0"},
+		{`COMPACT`, "(error) nothing to compact: the database is in-memory"},
 	}
 	for _, s := range steps {
 		if got := run(t, e, s.in); got != s.want {
@@ -59,7 +60,7 @@ func TestErrors(t *testing.T) {
 
 func TestPersistentEngine(t *testing.T) {
 	path := t.TempDir() + "/vaultdb.log"
-	s, _, err := store.Open(path, true)
+	s, _, err := store.Open(path, store.DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +70,7 @@ func TestPersistentEngine(t *testing.T) {
 	run(t, e, `DEL x`)
 	s.Close()
 
-	s2, _, err := store.Open(path, true)
+	s2, _, err := store.Open(path, store.DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,5 +81,8 @@ func TestPersistentEngine(t *testing.T) {
 	}
 	if got := run(t, e2, `INFO`); !strings.HasPrefix(got, "mode: persistent") {
 		t.Fatalf("INFO = %s", got)
+	}
+	if got := run(t, e2, `COMPACT`); !strings.HasPrefix(got, "OK, log shrank from") {
+		t.Fatalf("COMPACT = %s", got)
 	}
 }

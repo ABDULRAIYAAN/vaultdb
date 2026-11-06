@@ -5,6 +5,10 @@
 // disk first, and only then applied to the map. If the log write fails, the
 // map is left untouched, so memory never holds data the disk doesn't.
 //
+// The log only ever grows, so the store also compacts it: when most of the
+// file is old, overwritten data, it rewrites the log with just one SET per
+// live key.
+//
 // A sync.RWMutex guards everything: many readers at once, one writer at a
 // time. Holding the write lock across "append to log, then update map" also
 // keeps the log and the map in the same order.
@@ -24,66 +28,121 @@ var ErrNotFound = errors.New("key not found")
 // ErrEmptyKey is returned when a caller passes an empty key.
 var ErrEmptyKey = errors.New("key must not be empty")
 
+// DefaultCompactMinBytes is the smallest log that auto-compaction will touch.
+// Below this, rewriting is not worth the effort.
+const DefaultCompactMinBytes = 1 << 20 // 1 MB
+
+// Options configures a persistent store.
+type Options struct {
+	// Sync fsyncs every write before it returns.
+	Sync bool
+	// Repair starts even if the log is corrupt, keeping the data before the
+	// damage. Without it, a corrupt log stops the database from opening.
+	Repair bool
+	// AutoCompact rewrites the log automatically once it is at least
+	// CompactMinBytes and more than half of it is garbage.
+	AutoCompact     bool
+	CompactMinBytes int64
+}
+
+// DefaultOptions is safe, self-maintaining behaviour.
+func DefaultOptions() Options {
+	return Options{Sync: true, AutoCompact: true, CompactMinBytes: DefaultCompactMinBytes}
+}
+
 // Store is a thread-safe key-value store, optionally backed by a log file.
 type Store struct {
 	mu   sync.RWMutex
 	data map[string]string
 	log  *aol.Log // nil for a purely in-memory store
+	opts Options
+
+	// liveBytes is what the log would weigh if it held only current data:
+	// the file header plus one SET record per key. The difference between
+	// the real log size and this is garbage that compaction can remove.
+	liveBytes      int64
+	compactions    int
+	lastCompactErr error
 }
 
 // New creates an empty in-memory Store. Nothing is saved to disk.
 func New() *Store {
-	return &Store{data: make(map[string]string)}
+	return &Store{data: make(map[string]string), liveBytes: int64(aol.FileHeaderSize)}
 }
 
 // OpenInfo describes what Open loaded from disk.
 type OpenInfo struct {
-	Path      string
-	Records   int   // log records replayed
-	Keys      int   // keys in the database after replay
-	TornBytes int64 // bytes of a half-written record dropped after a crash
-	LogBytes  int64 // log file size
+	Path          string
+	Records       int   // log records replayed
+	Keys          int   // keys in the database after replay
+	TornBytes     int64 // bytes of a half-written record dropped after a crash
+	RepairedBytes int64 // bytes cut off by repair mode
+	Upgraded      bool  // an old-format log was converted to the current format
+	LogBytes      int64 // log file size after opening
 }
 
 // Open creates a Store backed by the log file at path, replaying the file to
-// rebuild the data. With syncWrites, every write is fsynced to disk before it
-// returns.
-func Open(path string, syncWrites bool) (*Store, OpenInfo, error) {
-	l, err := aol.Open(path, syncWrites)
+// rebuild the data.
+func Open(path string, opts Options) (*Store, OpenInfo, error) {
+	if opts.CompactMinBytes <= 0 {
+		opts.CompactMinBytes = DefaultCompactMinBytes
+	}
+	l, err := aol.Open(path, opts.Sync)
 	if err != nil {
 		return nil, OpenInfo{}, err
 	}
-	s := &Store{data: make(map[string]string), log: l}
+	s := New()
+	s.log = l
+	s.opts = opts
 
-	res, err := l.Replay(s.apply)
+	res, err := l.Replay(s.apply, aol.ReplayOptions{Repair: opts.Repair})
 	if err != nil {
 		l.Close()
 		return nil, OpenInfo{}, err
 	}
 	info := OpenInfo{
-		Path:      path,
-		Records:   res.Records,
-		Keys:      len(s.data),
-		TornBytes: res.TornBytes,
-		LogBytes:  res.BytesOnDisk,
+		Path:          path,
+		Records:       res.Records,
+		Keys:          len(s.data),
+		TornBytes:     res.TornBytes,
+		RepairedBytes: res.RepairedBytes,
 	}
+
+	// An old-format log can't be appended to. Rewriting it converts it.
+	if res.Legacy {
+		if err := s.compactLocked(); err != nil {
+			l.Close()
+			return nil, OpenInfo{}, err
+		}
+		info.Upgraded = true
+	}
+	info.LogBytes = l.Size()
 	return s, info, nil
 }
 
-// apply changes the map for one record. The caller holds the lock (or, during
-// replay, nobody else can see the store yet).
+// apply changes the map for one record and keeps liveBytes in step. The
+// caller holds the lock (or, during replay, nobody else can see the store).
 func (s *Store) apply(r aol.Record) {
 	switch r.Op {
 	case aol.OpSet:
+		if old, ok := s.data[r.Key]; ok {
+			s.liveBytes -= aol.RecordSize(r.Key, old)
+		}
 		s.data[r.Key] = r.Value
+		s.liveBytes += aol.RecordSize(r.Key, r.Value)
 	case aol.OpDelete:
-		delete(s.data, r.Key)
+		if old, ok := s.data[r.Key]; ok {
+			s.liveBytes -= aol.RecordSize(r.Key, old)
+			delete(s.data, r.Key)
+		}
 	case aol.OpClear:
 		s.data = make(map[string]string)
+		s.liveBytes = int64(aol.FileHeaderSize)
 	}
 }
 
-// write logs r (if persistent) and then applies it. Caller holds s.mu.
+// write logs r (if persistent), applies it, and compacts if the log has
+// become mostly garbage. Caller holds s.mu.
 func (s *Store) write(r aol.Record) error {
 	if s.log != nil {
 		if err := s.log.Append(r); err != nil {
@@ -91,7 +150,56 @@ func (s *Store) write(r aol.Record) error {
 		}
 	}
 	s.apply(r)
+	if s.shouldAutoCompact() {
+		// The write itself already succeeded and is safely on disk, so a
+		// failed compaction is reported through INFO rather than as an error.
+		s.lastCompactErr = s.compactLocked()
+	}
 	return nil
+}
+
+func (s *Store) shouldAutoCompact() bool {
+	if s.log == nil || !s.opts.AutoCompact {
+		return false
+	}
+	size := s.log.Size()
+	return size >= s.opts.CompactMinBytes && size > 2*s.liveBytes
+}
+
+// CompactResult reports what a compaction did.
+type CompactResult struct {
+	BytesBefore int64
+	BytesAfter  int64
+}
+
+// Compact rewrites the log so it holds exactly one SET record per key.
+func (s *Store) Compact() (CompactResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.log == nil {
+		return CompactResult{}, errors.New("nothing to compact: the database is in-memory")
+	}
+	before := s.log.Size()
+	err := s.compactLocked()
+	return CompactResult{BytesBefore: before, BytesAfter: s.log.Size()}, err
+}
+
+// compactLocked does the rewrite. Caller holds s.mu, so no write can slip in
+// between taking the snapshot and swapping the files.
+func (s *Store) compactLocked() error {
+	keys := s.sortedKeysLocked() // sorted, so compacted files are deterministic
+	err := s.log.Rewrite(func(emit func(aol.Record) error) error {
+		for _, k := range keys {
+			if err := emit(aol.Record{Op: aol.OpSet, Key: k, Value: s.data[k]}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		s.compactions++
+	}
+	return err
 }
 
 // Set stores value under key, replacing any existing value.
@@ -141,6 +249,10 @@ func (s *Store) Exists(key string) bool {
 func (s *Store) Keys() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.sortedKeysLocked()
+}
+
+func (s *Store) sortedKeysLocked() []string {
 	keys := make([]string, 0, len(s.data))
 	for k := range s.data {
 		keys = append(keys, k)
@@ -163,15 +275,33 @@ func (s *Store) Clear() error {
 	return s.write(aol.Record{Op: aol.OpClear})
 }
 
-// Persistent reports whether the store saves to disk.
-func (s *Store) Persistent() bool { return s.log != nil }
+// Stats is a snapshot of the store's state, for INFO.
+type Stats struct {
+	Persistent     bool
+	Keys           int
+	LogBytes       int64 // size of the log file
+	LiveBytes      int64 // size the log would be after compaction
+	Compactions    int   // compactions since the store was opened
+	AutoCompact    bool
+	LastCompactErr error
+}
 
-// LogSize returns the log file size in bytes (0 for an in-memory store).
-func (s *Store) LogSize() int64 {
-	if s.log == nil {
-		return 0
+// Stats returns current statistics.
+func (s *Store) Stats() Stats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	st := Stats{
+		Persistent:     s.log != nil,
+		Keys:           len(s.data),
+		Compactions:    s.compactions,
+		AutoCompact:    s.opts.AutoCompact,
+		LastCompactErr: s.lastCompactErr,
 	}
-	return s.log.Size()
+	if s.log != nil {
+		st.LogBytes = s.log.Size()
+		st.LiveBytes = s.liveBytes
+	}
+	return st
 }
 
 // Close closes the log file. The store must not be used afterwards.

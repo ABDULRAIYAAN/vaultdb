@@ -7,32 +7,47 @@
 //	vaultdb -memory                 keep everything in memory, save nothing
 //	vaultdb -nosync                 faster writes, but a power cut may lose
 //	                                the last few writes
+//	vaultdb -repair                 start even if the log is damaged, keeping
+//	                                everything before the damage
+//	vaultdb -autocompact=false      never compact automatically
 package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 
+	"github.com/ABDULRAIYAAN/vaultdb/internal/aol"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/engine"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/parser"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/store"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	dataPath := flag.String("data", filepath.Join("data", "vaultdb.log"), "log file to store data in")
 	memory := flag.Bool("memory", false, "in-memory only: nothing is saved to disk")
 	noSync := flag.Bool("nosync", false, "skip fsync after each write (faster, less safe)")
+	repair := flag.Bool("repair", false, "start even if the log is corrupt, keeping the data before the damage")
+	autoCompact := flag.Bool("autocompact", true, "compact the log automatically when it is mostly garbage")
 	flag.Parse()
 
-	db, banner, err := openStore(*dataPath, *memory, !*noSync)
+	opts := store.DefaultOptions()
+	opts.Sync = !*noSync
+	opts.Repair = *repair
+	opts.AutoCompact = *autoCompact
+
+	db, banner, err := openStore(*dataPath, *memory, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "could not open database:", err)
+		if errors.Is(err, aol.ErrCorrupt) {
+			fmt.Fprintln(os.Stderr, "The log file is damaged. Back it up, then run with -repair to keep everything before the damage.")
+		}
 		os.Exit(1)
 	}
 
@@ -86,17 +101,23 @@ func main() {
 }
 
 // openStore opens the right kind of store and returns a one-line description.
-func openStore(path string, memory, syncWrites bool) (*store.Store, string, error) {
+func openStore(path string, memory bool, opts store.Options) (*store.Store, string, error) {
 	if memory {
 		return store.New(), "Mode: in-memory. Nothing will be saved.", nil
 	}
-	db, info, err := store.Open(path, syncWrites)
+	db, info, err := store.Open(path, opts)
 	if err != nil {
 		return nil, "", err
 	}
 	banner := fmt.Sprintf("Loaded %d keys from %s (%d log records).", info.Keys, info.Path, info.Records)
 	if info.TornBytes > 0 {
 		banner += fmt.Sprintf("\nRecovered from a crash: dropped %d bytes of an unfinished write.", info.TornBytes)
+	}
+	if info.RepairedBytes > 0 {
+		banner += fmt.Sprintf("\nRepair mode: cut off %d damaged bytes. Everything before the damage was kept.", info.RepairedBytes)
+	}
+	if info.Upgraded {
+		banner += "\nUpgraded the log file to the new checksummed format."
 	}
 	return db, banner, nil
 }

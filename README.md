@@ -6,7 +6,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.2.0: Milestone 2 complete.** Data is saved to an append-only log on disk and survives restarts and crashes.
+**v0.3.0: Milestone 3 complete.** Data is saved to a checksummed append-only log, survives restarts and crashes, detects corruption, and compacts itself so the file never grows without limit.
 
 ## Quick start
 
@@ -17,7 +17,7 @@ go run ./cmd/vaultdb
 ```
 
 ```
-VaultDB 0.2.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.3.0. Type HELP for commands, EXIT to quit.
 Loaded 0 keys from data/vaultdb.log (0 log records).
 vaultdb> SET name raiyaan
 OK
@@ -30,7 +30,7 @@ Bye.
 Start it again and the data is still there:
 
 ```
-VaultDB 0.2.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.3.0. Type HELP for commands, EXIT to quit.
 Loaded 2 keys from data/vaultdb.log (2 log records).
 vaultdb> GET name
 "raiyaan"
@@ -43,6 +43,8 @@ Options:
 | `-data <path>` | Log file to use (default `data/vaultdb.log`) |
 | `-memory` | Keep everything in memory and save nothing |
 | `-nosync` | Skip fsync after each write: faster, but a power cut can lose the last few writes |
+| `-repair` | Start even if the log is damaged, keeping everything before the damage |
+| `-autocompact=false` | Never compact automatically (use the `COMPACT` command instead) |
 
 Run the tests (the `-race` flag checks for concurrency bugs; on Windows it needs a C compiler, so drop it if it errors):
 
@@ -61,7 +63,8 @@ go test -race ./...
 | `KEYS` | List every key, sorted |
 | `COUNT` | Number of keys |
 | `CLEAR` | Delete everything |
-| `INFO` | Storage mode, key count and log file size |
+| `INFO` | Keys, log size, live data size, garbage percentage, compactions |
+| `COMPACT` | Rewrite the log with only the current data |
 | `HELP` | Show the command list |
 | `EXIT` | Quit |
 
@@ -84,42 +87,54 @@ vaultdb/
   internal/parser/    turns a line of text into a command
   internal/engine/    runs commands, returns replies (reused by the TCP server later)
   internal/store/     the data: in-memory map plus the write-ahead rule
-  internal/aol/       the append-only log file: record format, append, replay, crash recovery
+  internal/aol/       the log file: record format, checksums, append, replay, crash recovery, atomic rewrite
 ```
 
 ### How persistence works
 
 Data is never edited in place on disk. Every change is **appended** to the end of `data/vaultdb.log` as a record. On startup VaultDB reads the log from the beginning and **replays** every record, which rebuilds the in-memory map exactly as it was. Reads are served from memory and never touch the disk.
 
-Each record is binary, with a fixed 9-byte header:
+The file starts with a 9-byte header (`VAULTDB\0` plus a format version byte), followed by records. Each record is binary:
 
 ```
-+--------+-------------+-------------+-----------+-------------+
-| op (1) | keyLen (4)  | valLen (4)  | key bytes | value bytes |
-+--------+-------------+-------------+-----------+-------------+
- op: 1 = SET, 2 = DEL, 3 = CLEAR      lengths are big-endian uint32
++------------+--------+------------+------------+-------------+-----+-------+
+| hdrCRC (4) | op (1) | keyLen (4) | valLen (4) | bodyCRC (4) | key | value |
++------------+--------+------------+------------+-------------+-----+-------+
+ op: 1 = SET, 2 = DEL, 3 = CLEAR          all integers big-endian
+ hdrCRC  = CRC-32C of op, keyLen, valLen, bodyCRC
+ bodyCRC = CRC-32C of key and value
 ```
 
 Length prefixes (instead of, say, one line of text per record) mean keys and values can contain any bytes, including spaces, newlines and quotes, without escaping.
+
+**Why two checksums?** With a single checksum over the whole record, a flipped bit in a length field would make the reader trust a wrong length before it could check anything. It could then read past the real end of the record, decide the file was cut off, and throw away every valid record after it. Verifying the small fixed-size header first means a length is only used once it is known to be correct.
+
+### How compaction works
+
+Overwriting a key 1,000 times leaves 999 dead records in the log. VaultDB tracks how big the log *would* be with one `SET` per live key, and when the real file is at least 1 MB and more than twice that size, it compacts:
+
+1. Write the current data to a temporary file, `vaultdb.log.compact`.
+2. `fsync` the temporary file so it is fully on disk.
+3. Rename it over `vaultdb.log`.
+
+A rename within one folder is **atomic**: at every moment the path holds either the complete old log or the complete new one, never a mix. If the machine dies before step 3, the old log is untouched and the leftover temporary file is deleted on the next start.
 
 ### Design notes
 
 - **Write-ahead rule.** A write goes to the log first and to memory second. If the disk write fails, memory is left unchanged, so the database never reports data that isn't saved.
 - **fsync on every write.** `Write` only hands data to the operating system, which may keep it in RAM for a while. `fsync` forces it onto the physical disk, so once VaultDB replies `OK`, a power cut can't lose that write. This costs speed; `-nosync` trades safety for speed, which is how many databases offer it.
 - **Torn-write recovery.** If the machine dies halfway through writing a record, the file ends in a partial record. Replay detects it, cuts the file back to the last complete record and starts normally.
-- **Corruption is refused, not guessed.** An impossible operation or length in the middle of the file stops startup with an error instead of loading wrong data. Milestone 3 adds checksums to catch subtler damage.
+- **Corruption is refused, not guessed.** A checksum failure in the middle of the file stops startup with an error and the exact byte offset, instead of loading wrong data. `-repair` keeps everything before the damage.
+- **Format upgrades are automatic.** A log written by VaultDB 0.2 (no header, no checksums) is detected, read, and rewritten in the new format on first start.
+- **Windows-safe file swapping.** Windows refuses to rename over a file that is still open, so compaction closes the log before the rename and reopens whichever file ends up at the path, even if the rename fails.
 - **The store is thread-safe.** A `sync.RWMutex` lets many readers in at once but gives writers exclusive access. The write lock covers both the log append and the map update, so the log and memory always see changes in the same order.
 - **The engine returns strings instead of printing.** The same engine will serve both the shell and the TCP server, so it should not know where its output goes.
-
-### Known limitation (fixed in milestone 3)
-
-The log only grows. Setting the same key 1,000 times stores 1,000 records even though only the last one matters. Milestone 3 adds **compaction**: rewriting the log with just the current data.
 
 ## Roadmap
 
 - [x] 1. In-memory key-value store and interactive shell
 - [x] 2. Persistence: append-only log, so data survives a restart
-- [ ] 3. Crash recovery (checksums) and log compaction
+- [x] 3. Crash recovery (checksums) and log compaction
 - [ ] 4. Indexing: hash index, then a B-tree for range queries
 - [ ] 5. A small SQL-like query language (`CREATE TABLE`, `INSERT`, `SELECT ... WHERE`)
 - [ ] 6. TCP server so multiple clients can connect
