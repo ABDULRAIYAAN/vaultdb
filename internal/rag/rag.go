@@ -25,7 +25,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -95,24 +95,40 @@ type IngestReport struct {
 	Chunks                                      int
 }
 
-// Ingest reads every text file under root and stores its chunks. Files that
-// haven't changed since the last run are skipped, changed files have their
-// old chunks replaced, so running it again is cheap.
+// Ingest reads every text file under the folder root and stores its chunks.
+// Files that haven't changed since the last run are skipped, changed files
+// have their old chunks replaced, so running it again is cheap.
 func (r *RAG) Ingest(ctx context.Context, root string, progress func(string)) (IngestReport, error) {
+	if _, err := os.Stat(root); err != nil {
+		return IngestReport{}, err
+	}
+	rep, err := r.IngestFS(ctx, os.DirFS(root), progress)
+	if errors.Is(err, ErrNoFiles) {
+		err = fmt.Errorf("%w in %s", err, root)
+	}
+	return rep, err
+}
+
+// ErrNoFiles means the folder had nothing Ingest knows how to read.
+var ErrNoFiles = errors.New("no text files found (supported: .md .txt and common code files; convert PDFs and Word files to text first)")
+
+// IngestFS is Ingest for any file system, such as files embedded in the
+// program. Paths in sources are the slash-separated paths inside fsys.
+func (r *RAG) IngestFS(ctx context.Context, fsys fs.FS, progress func(string)) (IngestReport, error) {
 	var rep IngestReport
 	var files []string
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
-			if path != root && (strings.HasPrefix(d.Name(), ".") || d.Name() == "node_modules") {
-				return filepath.SkipDir
+			if p != "." && (strings.HasPrefix(d.Name(), ".") || d.Name() == "node_modules") {
+				return fs.SkipDir
 			}
 			return nil
 		}
-		if TextExtensions[strings.ToLower(filepath.Ext(path))] {
-			files = append(files, path)
+		if TextExtensions[strings.ToLower(path.Ext(p))] {
+			files = append(files, p)
 		} else {
 			rep.Skipped++
 		}
@@ -122,16 +138,16 @@ func (r *RAG) Ingest(ctx context.Context, root string, progress func(string)) (I
 		return rep, err
 	}
 	if len(files) == 0 {
-		return rep, fmt.Errorf("no text files found in %s (supported: .md .txt and common code files; convert PDFs and Word files to text first)", root)
+		return rep, ErrNoFiles
 	}
 	sort.Strings(files)
 	seen := map[string]bool{}
 
-	for _, path := range files {
+	for _, rel := range files {
 		if err := ctx.Err(); err != nil {
 			return rep, err
 		}
-		data, err := os.ReadFile(path)
+		data, err := fs.ReadFile(fsys, rel)
 		if err != nil {
 			return rep, err
 		}
@@ -139,8 +155,6 @@ func (r *RAG) Ingest(ctx context.Context, root string, progress func(string)) (I
 			rep.Skipped++
 			continue
 		}
-		rel, _ := filepath.Rel(root, path)
-		rel = filepath.ToSlash(rel)
 		seen[rel] = true
 		sum := sha256.Sum256(data)
 		hash := hex.EncodeToString(sum[:])
