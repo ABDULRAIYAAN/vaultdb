@@ -322,7 +322,7 @@ type Stats struct {
 	Persistent     bool
 	Keys           int
 	LogBytes       int64 // size of the log file
-	LiveBytes      int64 // size the log would be after compaction
+	LiveBytes      int64 // size of the current data (what a compacted log would weigh)
 	Compactions    int   // compactions since the store was opened
 	AutoCompact    bool
 	LastCompactErr error
@@ -339,9 +339,9 @@ func (s *Store) Stats() Stats {
 		AutoCompact:    s.opts.AutoCompact,
 		LastCompactErr: s.lastCompactErr,
 	}
+	st.LiveBytes = s.liveBytes
 	if s.log != nil {
 		st.LogBytes = s.log.Size()
-		st.LiveBytes = s.liveBytes
 	}
 	return st
 }
