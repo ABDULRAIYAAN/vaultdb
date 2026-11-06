@@ -23,3 +23,7 @@ Thumbs.db
 # AI provider keys (never commit these)
 vaultdb-chat.env
 *.env
+
+# Front-end build inputs (dist/ is committed so Go users don't need Node)
+web/node_modules/
+web/src/fonts/

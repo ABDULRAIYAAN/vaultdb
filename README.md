@@ -143,6 +143,21 @@ Exact search grows in step with the collection; HNSW barely grows, so the gap wi
 
 **The honest worst case:** on uniformly random 128-dimension vectors, recall is much lower (23.5% at efSearch 64, 55.5% at 256). In high dimensions, random points are all almost the same distance apart (the "curse of dimensionality"), so "nearest" barely means anything and no graph shortcut can find it reliably. Real embeddings are not like that, which is why approximate indexes work in practice. The benchmark includes both so the numbers are not cherry-picked.
 
+## The playground website
+
+`vaultdb-web` serves a website where anyone can try VaultDB in a browser: a live B-tree that splits as you insert keys, a terminal connected to a private VaultDB sandbox, an animated HNSW search, benchmark charts and a docs assistant.
+
+```bash
+go run ./cmd/vaultdb-web          # then open http://localhost:8080
+```
+
+On Windows, double-click `web.bat`.
+
+- **Every visitor gets a private, in-memory database**, deleted after 30 minutes idle, capped at 1 MB. Nobody can see anyone else's data.
+- **Hardened for the public internet:** per-IP rate limits, 4 KB commands, 16 KB request bodies, server timeouts, a strict Content-Security-Policy (no inline scripts or styles, no third-party requests), `nosniff`, `frame-ancestors 'none'`, HSTS on HTTPS, and random `HttpOnly`, `SameSite=Strict` cookies. A daily cap protects any paid AI key behind the docs assistant.
+- **One binary.** The front end is built into the server with `go:embed`, so deploying means copying one file.
+- **Front end:** plain JavaScript with [Motion](https://motion.dev) for animation, bundled by esbuild into 175 KB including self-hosted fonts. The B-tree drawing uses the same insert-and-split rules as the Go code. Animations respect `prefers-reduced-motion`. Source in `web/src`; rebuild with `cd web && npm install && npm run build`.
+
 ## Chat with your documents (RAG)
 
 `vaultdb-chat` uses VaultDB as the memory of an AI assistant. It reads a folder of notes or code, stores every chunk as a vector, and answers questions using only the passages it finds, citing them:
@@ -287,6 +302,9 @@ vaultdb/
   internal/ai/        AI providers: OpenAI-compatible, Gemini, Anthropic adapters and a local embedder
   internal/rag/       document chunking, incremental ingest, retrieval and grounded answers
   cmd/vaultdb-chat/   chat-with-your-documents command
+  internal/web/       playground server: sandboxes, rate limits, security headers, JSON API
+  cmd/vaultdb-web/    runs the playground website
+  web/                the website: src/ (HTML, CSS, JS), dist/ (built, embedded into the binary)
   internal/server/    TCP server: goroutine per client, length-prefixed replies, limits, graceful shutdown
   internal/client/    Go client library for the protocol
   cmd/vaultdb-cli/    command-line client (interactive or one-shot with -c)
@@ -357,7 +375,8 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 5. A small SQL-like query language (`CREATE TABLE`, `INSERT`, `SELECT ... WHERE`, `UPDATE`, `DELETE`)
 - [x] 6. TCP server so multiple clients can connect
 - [x] 7. Vector search: store embeddings, nearest-neighbour queries (brute force, then HNSW), RAG chat with any AI provider
-- [ ] 8. Benchmarks
+- [x] 8a. Benchmarks, playground website
+- [ ] 8b. Deploy online with a custom domain, v1.0 release
 
 ## Author
 

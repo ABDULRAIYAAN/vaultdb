@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VaultDB: a database built from scratch in Go</title>
+<meta name="description" content="Try VaultDB in your browser: a key-value store, SQL, a B-tree index, crash-safe storage and HNSW vector search, all written from scratch in Go by Abdul Raiyaan.">
+<meta property="og:title" content="VaultDB: a database built from scratch in Go">
+<meta property="og:description" content="Type real commands, watch a B-tree split, search vectors with HNSW. Everything here runs on VaultDB.">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#0C1315">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/app.css">
+<script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+<a class="skip" href="#playground">Skip to the playground</a>
+
+<header class="top">
+  <a class="wordmark" href="/" aria-label="VaultDB home"><span class="mark" aria-hidden="true"></span>VaultDB</a>
+  <nav aria-label="Main">
+    <a href="#playground">Playground</a>
+    <a href="#how">How it works</a>
+    <a href="#benchmarks">Benchmarks</a>
+    <a href="#ask">Ask the docs</a>
+    <a href="https://github.com/ABDULRAIYAAN/vaultdb" rel="noopener">GitHub</a>
+  </nav>
+</header>
+
+<main>
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="hero-copy">
+      <h1 id="hero-title">A database, built from the disk up.</h1>
+      <p class="lede">VaultDB is a key-value store, a SQL engine and a vector search index, written from scratch in Go. Every page here talks to it live.</p>
+      <div class="actions">
+        <a class="btn" href="#playground">Open the playground</a>
+        <a class="btn quiet" href="https://github.com/ABDULRAIYAAN/vaultdb" rel="noopener">Read the code</a>
+      </div>
+    </div>
+
+    <figure class="tree-card" aria-labelledby="tree-caption">
+      <div class="tree-stage" id="tree-stage" role="img" aria-label="A B-tree that grows as keys are inserted"></div>
+      <figcaption>
+        <p id="tree-caption" class="tree-caption" aria-live="polite">This is VaultDB's B-tree logic, running in your browser.</p>
+        <form class="tree-form" id="tree-form" autocomplete="off">
+          <label for="tree-key">Insert a number</label>
+          <input id="tree-key" inputmode="numeric" pattern="[0-9]{1,3}" maxlength="3" placeholder="0 to 999">
+          <button class="btn small" type="submit">Insert</button>
+          <button class="btn small quiet" type="button" id="tree-reset">Start over</button>
+        </form>
+      </figcaption>
+    </figure>
+  </section>
+
+  <section id="playground" class="section" aria-labelledby="pg-title">
+    <div class="section-head">
+      <h2 id="pg-title">Playground</h2>
+      <p>You have your own private database for the next 30 minutes. Type a command, or pick an example.</p>
+    </div>
+
+    <div class="pg">
+      <div class="terminal" id="terminal">
+        <div class="term-out" id="term-out" aria-live="polite">
+          <p class="term-note">Connected to a fresh VaultDB sandbox. Try <code>HELP</code>.</p>
+        </div>
+        <form class="term-in" id="term-form" autocomplete="off">
+          <label for="term-input" class="prompt">vaultdb&gt;</label>
+          <input id="term-input" spellcheck="false" autocapitalize="off" aria-label="Command">
+        </form>
+      </div>
+
+      <aside class="pg-side" aria-label="Sandbox details">
+        <h3>Your sandbox</h3>
+        <dl class="stats">
+          <div><dt>Keys</dt><dd id="st-keys">0</dd></div>
+          <div><dt>Data</dt><dd id="st-bytes">0 B</dd></div>
+          <div><dt>Last command</dt><dd id="st-time">waiting</dd></div>
+        </dl>
+        <h3>Examples</h3>
+        <div class="examples" id="examples"></div>
+        <button class="btn small quiet" type="button" id="term-reset">Empty my sandbox</button>
+        <p class="server-line" id="server-line"></p>
+      </aside>
+    </div>
+  </section>
+
+  <section id="how" class="section" aria-labelledby="how-title">
+    <div class="section-head">
+      <h2 id="how-title">How it works</h2>
+      <p>What happens between pressing Enter and seeing <code>OK</code>.</p>
+    </div>
+
+    <ol class="pipeline">
+      <li><h3>Parser</h3><p>Cuts your line into words, keeping <code>"quoted text"</code> together. SQL goes through a lexer and a recursive descent parser instead.</p></li>
+      <li><h3>Engine</h3><p>Checks the command and decides what to do. Runs SQL statements one at a time so two clients can never write the same row.</p></li>
+      <li><h3>B-tree</h3><p>Keeps every key sorted in memory. 100,000 keys fit in four levels, so a lookup takes about 0.2 microseconds.</p></li>
+      <li><h3>Append-only log</h3><p>Every change is written to disk first, with two CRC-32C checksums, and forced onto the disk with fsync before you see <code>OK</code>.</p></li>
+    </ol>
+
+    <div class="split">
+      <div class="explain">
+        <h3>Finding meaning with HNSW</h3>
+        <p>Vector search finds the stored items closest in meaning to a question. Checking every item is exact but slow, so VaultDB builds an HNSW graph: a few long-distance links on the top layer, more detailed links below.</p>
+        <p>A search starts at the top, hops towards the target until it can't get closer, then drops a layer. On 100,000 vectors that is 81 times faster than checking everything, and it still finds 99.5% of the true nearest neighbours.</p>
+        <button class="btn small" type="button" id="hnsw-run">Run a search</button>
+        <p class="fine">A simplified two-dimensional drawing of the real algorithm. Real embeddings have hundreds of dimensions.</p>
+      </div>
+      <div class="hnsw" id="hnsw" role="img" aria-label="Three graph layers; a search hops down from the top layer to the nearest point"></div>
+    </div>
+
+    <div class="split reverse">
+      <div class="explain">
+        <h3>Surviving a power cut</h3>
+        <p>Data is never edited in place. Each change becomes a record at the end of the log, and on start-up VaultDB replays the log from the beginning.</p>
+        <p>If the power goes off mid-write, the half-written record fails its checksum and is cut off. Damage anywhere else stops start-up with the exact byte offset instead of loading wrong data. Old records are tidied away by compaction: write a fresh log, fsync it, then rename it over the old one in one atomic step.</p>
+      </div>
+      <div class="record" aria-label="Layout of one log record">
+        <div class="rec-row">
+          <span class="seg crc">header CRC</span><span class="seg">op</span><span class="seg">key length</span><span class="seg">value length</span><span class="seg crc">data CRC</span><span class="seg key">key</span><span class="seg val">value</span>
+        </div>
+        <p class="fine">One record. The header checksum is verified before any length is trusted.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="benchmarks" class="section" aria-labelledby="bench-title">
+    <div class="section-head">
+      <h2 id="bench-title">Benchmarks</h2>
+      <p>Measured with the benchmark tool in the repository: 128-dimension vectors, the 10 nearest neighbours, on a two-core machine.</p>
+    </div>
+    <div class="charts">
+      <figure>
+        <img src="/img/search-time.svg" width="800" height="480" alt="Line chart: exact search time grows from 1.6 ms at 10,000 vectors to 35.7 ms at 100,000, while HNSW grows from 0.17 ms to 0.44 ms.">
+      </figure>
+      <figure>
+        <img src="/img/recall.svg" width="800" height="480" alt="Line chart of recall against search time at 100,000 vectors: clustered data reaches 99.5% recall at 0.44 ms; uniform random data stays below 56%.">
+      </figure>
+    </div>
+    <p class="note">The uniform random line is the worst case on purpose. In 128 dimensions random points are almost all the same distance apart, so no shortcut can find "the nearest" reliably. Real text embeddings cluster by topic, which is why the clustered line matters in practice.</p>
+  </section>
+
+  <section id="ask" class="section" aria-labelledby="ask-title">
+    <div class="section-head">
+      <h2 id="ask-title">Ask the docs</h2>
+      <p>Ask how VaultDB works. It searches its own code and README with HNSW and shows the passages it found.</p>
+    </div>
+    <form class="ask-form" id="ask-form" autocomplete="off">
+      <label for="ask-input" class="visually-hidden">Your question</label>
+      <input id="ask-input" maxlength="500" placeholder="How does compaction stay safe if the power goes off?">
+      <button class="btn" type="submit">Ask</button>
+    </form>
+    <div class="ask-out" id="ask-out" aria-live="polite"></div>
+  </section>
+</main>
+
+<footer class="foot">
+  <p>Built by <a href="https://www.linkedin.com/in/abdulraiyaan" rel="noopener">Abdul Raiyaan</a>. Source on <a href="https://github.com/ABDULRAIYAAN/vaultdb" rel="noopener">GitHub</a>.</p>
+  <p><a href="/privacy">Privacy</a> <a href="/terms">Terms</a></p>
+</footer>
+</body>
+</html>
