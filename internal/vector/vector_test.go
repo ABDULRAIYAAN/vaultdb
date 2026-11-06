@@ -104,7 +104,7 @@ func TestFlatSearchIsExact(t *testing.T) {
 
 func TestManager(t *testing.T) {
 	m := NewManager(store.New())
-	if err := m.Create("docs", 3, Cosine); err != nil {
+	if err := m.Create("docs", 3, Cosine, IndexFlat); err != nil {
 		t.Fatal(err)
 	}
 	m.Add("docs", "car", Vector{1, 0, 0}, "The car broke down")
@@ -139,9 +139,9 @@ func TestManager(t *testing.T) {
 		"wrong dim on add":    func() error { _, err := m.Add("docs", "x", Vector{1, 2}, ""); return err }(),
 		"wrong dim on search": func() error { _, err := m.Search("docs", Vector{1}, 1); return err }(),
 		"missing collection":  func() error { _, err := m.Search("nope", Vector{1, 2, 3}, 1); return err }(),
-		"duplicate create":    m.Create("docs", 3, Cosine),
-		"bad name":            m.Create("bad:name", 3, Cosine),
-		"bad dim":             m.Create("big", MaxDim+1, Cosine),
+		"duplicate create":    m.Create("docs", 3, Cosine, IndexFlat),
+		"bad name":            m.Create("bad:name", 3, Cosine, IndexHNSW),
+		"bad dim":             m.Create("big", MaxDim+1, Cosine, IndexHNSW),
 		"empty id":            func() error { _, err := m.Add("docs", "", Vector{1, 2, 3}, ""); return err }(),
 	}
 	for what, err := range errs {
@@ -170,7 +170,7 @@ func TestVectorsSurviveRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := NewManager(st)
-	m.Create("notes", 2, L2)
+	m.Create("notes", 2, L2, IndexHNSW)
 	m.Add("notes", "a", Vector{0, 0}, "origin")
 	m.Add("notes", "b", Vector{10, 10}, "far away")
 	st.Close()
@@ -188,7 +188,7 @@ func TestVectorsSurviveRestart(t *testing.T) {
 
 func TestIDsMayContainColons(t *testing.T) {
 	m := NewManager(store.New())
-	m.Create("c", 1, L2)
+	m.Create("c", 1, L2, IndexHNSW)
 	m.Add("c", "doc:1:chunk:3", Vector{1}, "x")
 	m.Reset() // force a reload from the store
 	if hits, _ := m.Search("c", Vector{1}, 1); len(hits) != 1 || hits[0].ID != "doc:1:chunk:3" {

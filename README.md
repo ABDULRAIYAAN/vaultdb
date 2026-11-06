@@ -6,7 +6,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.6.0: Milestone 6 complete.** VaultDB runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v0.7.0: vector search with HNSW.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -17,7 +17,7 @@ go run ./cmd/vaultdb
 ```
 
 ```
-VaultDB 0.6.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.7.0. Type HELP for commands, EXIT to quit.
 Loaded 0 keys from data/vaultdb.log (0 log records).
 vaultdb> SET name raiyaan
 OK
@@ -30,7 +30,7 @@ Bye.
 Start it again and the data is still there:
 
 ```
-VaultDB 0.6.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.7.0. Type HELP for commands, EXIT to quit.
 Loaded 2 keys from data/vaultdb.log (2 log records).
 vaultdb> GET name
 "raiyaan"
@@ -86,6 +86,51 @@ Sending the length first means a reply can contain newlines (like a SQL result t
 - **SQL statements run one at a time.** An `INSERT` checks that a primary key is free and then writes the row. Without serialising, two clients could both see the key as free and both write it. A test runs 50 clients racing to insert the same 20 ids and checks each id is inserted exactly once.
 - **Protection against bad clients:** commands over 1 MB are rejected without buffering them, silent clients are disconnected after 5 minutes, and connections are capped at 1,000.
 - **Graceful shutdown:** Ctrl+C stops accepting new clients, lets running commands finish, disconnects everyone, then closes the log file cleanly.
+
+## Vector search
+
+Embedding models turn text into vectors (lists of numbers) where similar meanings point in similar directions. VaultDB stores them and finds the nearest ones:
+
+```
+vaultdb> VCREATE docs 3
+OK, collection docs created (3 dimensions, COSINE, HNSW index)
+vaultdb> VADD docs car "[1, 0, 0]" "The car broke down"
+vaultdb> VADD docs vehicle "[0.9, 0.1, 0]" "My vehicle stopped working"
+vaultdb> VADD docs cake "[0, 0, 1]" "I love chocolate cake"
+vaultdb> VSEARCH docs "[1, 0.05, 0]" 2
+1) "car"  distance 0.0012  "The car broke down"
+2) "vehicle"  distance 0.0018  "My vehicle stopped working"
+```
+
+Commands: `VCREATE <coll> <dim> [COSINE|L2] [HNSW|FLAT]`, `VADD`, `VGET`, `VDEL`, `VSEARCH <coll> <vector> [k]`, `VDROP`, `VCOLLECTIONS`. Vectors are stored as keys (`vec:meta:`, `vec:item:`) in binary, 4 bytes per number, next to their original text, so they are crash-safe and survive restarts; the index is rebuilt in memory on startup.
+
+### HNSW, built from scratch
+
+Checking every vector (the `FLAT` index) is exact but slow. **HNSW** (Hierarchical Navigable Small World, [Malkov & Yashunin](https://arxiv.org/abs/1603.09320)), the index used by Pinecone, Qdrant, Weaviate and pgvector, is a stack of graphs:
+
+```
+layer 2:   A ----------------------- F               few nodes, long jumps
+layer 1:   A ------- C ------- E --- F
+layer 0:   A -- B -- C -- D -- E --- F -- G -- H     every node, short links
+```
+
+A search starts at the top, walks greedily towards the query, drops a layer, and repeats, then does a wider search on layer 0. Implementation details:
+
+- **Random layer per node** with probability falling by 1/M per layer, so the upper layers stay sparse.
+- **Neighbour selection heuristic** from the paper: a candidate is skipped if an already chosen neighbour is closer to it than the new node is, which spreads links in different directions and keeps the graph navigable.
+- **Bidirectional links**, pruned back to M (2M on layer 0) with the same heuristic when a node gets too many.
+- **Cosine vectors are normalised once on insert**, so each distance is a single dot product.
+- **Deletes are tombstones** (deleted nodes remain as stepping stones but are never returned); the graph is rebuilt when tombstones outnumber live vectors.
+- **Parallel searches** reuse "visited" sets from a pool, marked with a stamp number so they never need clearing.
+
+Measured on 10,000 random 128-dimension vectors (M=16, efConstruction=200, efSearch=64):
+
+| Index | Search time (k=10) | Recall@10 |
+|---|---|---|
+| FLAT (exact) | 1.96 ms | 100% |
+| HNSW | 0.40 ms | 99.1% (cosine), 99.5% (L2) |
+
+Random uniform vectors are the hardest case for HNSW; the gap grows with collection size and with real embeddings, which cluster.
 
 ## SQL
 
@@ -169,6 +214,7 @@ vaultdb/
   internal/store/     the data: B-tree in memory, write-ahead rule, compaction
   internal/btree/     sorted in-memory index: insert with splits, delete with borrow/merge, range walks
   internal/sql/       SQL lexer, recursive descent parser, AST, executor, result tables
+  internal/vector/    vectors, cosine/L2 distance, flat index, HNSW index, collections
   internal/server/    TCP server: goroutine per client, length-prefixed replies, limits, graceful shutdown
   internal/client/    Go client library for the protocol
   cmd/vaultdb-cli/    command-line client (interactive or one-shot with -c)

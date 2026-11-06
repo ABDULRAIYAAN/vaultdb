@@ -33,7 +33,8 @@ const HelpText = `Commands:
   EXIT                quit
 
 VECTORS (similarity search, stored as keys under vec:):
-  VCREATE <coll> <dim> [COSINE|L2]      new collection, e.g. VCREATE docs 384
+  VCREATE <coll> <dim> [COSINE|L2] [HNSW|FLAT]   e.g. VCREATE docs 384
+                                        (HNSW: fast, approximate; FLAT: exact)
   VADD <coll> <id> <vector> [text]      VADD docs n1 "[0.1, 0.9, 0.3]" "some text"
   VSEARCH <coll> <vector> [k]           the k nearest vectors (default 5)
   VGET <coll> <id>  |  VDEL <coll> <id>  |  VDROP <coll>  |  VCOLLECTIONS
@@ -250,23 +251,29 @@ func (e *Engine) vectorCommand(cmd parser.Command) (reply string, ok bool) {
 	fail := func(err error) (string, bool) { return "(error) " + err.Error(), true }
 	switch cmd.Name {
 	case "VCREATE":
-		if len(a) != 2 && len(a) != 3 {
-			return usage("VCREATE <collection> <dimensions> [COSINE|L2]"), true
+		if len(a) < 2 || len(a) > 4 {
+			return usage("VCREATE <collection> <dimensions> [COSINE|L2] [HNSW|FLAT]"), true
 		}
 		dim, err := strconv.Atoi(a[1])
 		if err != nil {
 			return "(error) dimensions must be a whole number", true
 		}
 		metric := vector.Cosine
-		if len(a) == 3 {
+		if len(a) >= 3 {
 			if metric, err = vector.ParseMetric(a[2]); err != nil {
 				return fail(err)
 			}
 		}
-		if err := e.vec.Create(a[0], dim, metric); err != nil {
+		kind := vector.IndexHNSW
+		if len(a) == 4 {
+			if kind, err = vector.ParseIndexKind(a[3]); err != nil {
+				return fail(err)
+			}
+		}
+		if err := e.vec.Create(a[0], dim, metric, kind); err != nil {
 			return fail(err)
 		}
-		return fmt.Sprintf("OK, collection %s created (%d dimensions, %s)", a[0], dim, metric), true
+		return fmt.Sprintf("OK, collection %s created (%d dimensions, %s, %s index)", a[0], dim, metric, kind), true
 
 	case "VDROP":
 		if len(a) != 1 {
@@ -368,7 +375,7 @@ func (e *Engine) vectorCommand(cmd parser.Command) (reply string, ok bool) {
 			if i > 0 {
 				b.WriteByte('\n')
 			}
-			fmt.Fprintf(&b, "%d) %s  %d dims, %s, %d vectors", i+1, c.Name, c.Dim, c.Metric, c.Count)
+			fmt.Fprintf(&b, "%d) %s  %d dims, %s, %s index, %d vectors", i+1, c.Name, c.Dim, c.Metric, c.Index, c.Count)
 		}
 		return b.String(), true
 	}

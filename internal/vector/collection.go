@@ -18,7 +18,7 @@ import (
 // Like SQL tables, vector collections are ordinary keys in the store, so
 // they are saved to disk, crash-safe and compacted like everything else:
 //
-//	vec:meta:docs          -> {"dim":768,"metric":"COSINE"}
+//	vec:meta:docs          -> {"dim":768,"metric":"COSINE","index":"HNSW"}
 //	vec:item:docs:note1    -> binary vector + the original text
 //
 // On top of that, each collection keeps an index in memory for fast search.
@@ -45,7 +45,7 @@ type Hit struct {
 }
 
 // Index finds the nearest vectors. The flat index below checks every
-// vector; the HNSW index (next step) jumps through a graph instead.
+// vector; the HNSW index (hnsw.go) jumps through a graph instead.
 type Index interface {
 	Add(id string, v Vector)
 	Remove(id string)
@@ -53,11 +53,31 @@ type Index interface {
 	Len() int
 }
 
+// IndexKind chooses how a collection is searched.
+type IndexKind string
+
+const (
+	// IndexHNSW is fast and approximate: the default.
+	IndexHNSW IndexKind = "HNSW"
+	// IndexFlat checks every vector: exact, but slow on big collections.
+	IndexFlat IndexKind = "FLAT"
+)
+
+// ParseIndexKind accepts HNSW or FLAT in any case.
+func ParseIndexKind(s string) (IndexKind, error) {
+	switch k := IndexKind(strings.ToUpper(s)); k {
+	case IndexHNSW, IndexFlat:
+		return k, nil
+	}
+	return "", fmt.Errorf("unknown index %q (use HNSW or FLAT)", s)
+}
+
 // Info describes a collection.
 type Info struct {
 	Name   string
 	Dim    int
 	Metric Metric
+	Index  IndexKind
 	Count  int
 }
 
@@ -86,8 +106,9 @@ var validName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 const MaxDim = 8192
 
 type meta struct {
-	Dim    int    `json:"dim"`
-	Metric Metric `json:"metric"`
+	Dim    int       `json:"dim"`
+	Metric Metric    `json:"metric"`
+	Index  IndexKind `json:"index,omitempty"` // empty means HNSW
 }
 
 // load reads every collection from the store. Caller holds m.mu for writing.
@@ -122,9 +143,18 @@ func (m *Manager) load() error {
 }
 
 func newCollection(name string, md meta) *collection {
+	if md.Index == "" {
+		md.Index = IndexHNSW
+	}
+	var idx Index
+	if md.Index == IndexFlat {
+		idx = NewFlat(md.Metric)
+	} else {
+		idx = NewHNSW(md.Metric, DefaultM, DefaultEfConstruction, DefaultEfSearch)
+	}
 	return &collection{
-		info:     Info{Name: name, Dim: md.Dim, Metric: md.Metric},
-		index:    NewFlat(md.Metric),
+		info:     Info{Name: name, Dim: md.Dim, Metric: md.Metric, Index: md.Index},
+		index:    idx,
 		payloads: map[string]string{},
 	}
 }
@@ -146,7 +176,7 @@ func (m *Manager) get(name string) (*collection, error) {
 }
 
 // Create makes a new, empty collection.
-func (m *Manager) Create(name string, dim int, metric Metric) error {
+func (m *Manager) Create(name string, dim int, metric Metric, kind IndexKind) error {
 	if !validName.MatchString(name) {
 		return errors.New("collection names may use letters, digits, _ and -, up to 64 characters")
 	}
@@ -161,7 +191,7 @@ func (m *Manager) Create(name string, dim int, metric Metric) error {
 	if _, exists := m.colls[name]; exists {
 		return fmt.Errorf("vector collection %s already exists", name)
 	}
-	md := meta{Dim: dim, Metric: metric}
+	md := meta{Dim: dim, Metric: metric, Index: kind}
 	raw, _ := json.Marshal(md)
 	if err := m.st.Set(metaPrefix+name, string(raw)); err != nil {
 		return err
