@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/ABDULRAIYAAN/vaultdb/internal/store"
 )
@@ -39,7 +40,16 @@ type Store interface {
 }
 
 // Executor runs parsed statements against a Store.
-type Executor struct{ st Store }
+//
+// Statements run one at a time. A single statement can touch many keys, for
+// example INSERT checks that a primary key is free and then writes the row.
+// If two network clients ran INSERTs at once, both could see the key as free
+// and both would write it. The mutex makes each statement all-or-nothing as
+// far as other clients can tell.
+type Executor struct {
+	mu sync.Mutex
+	st Store
+}
 
 // NewExecutor creates an executor on top of st.
 func NewExecutor(st Store) *Executor { return &Executor{st: st} }
@@ -85,6 +95,8 @@ func (e *Executor) Exec(query string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	switch s := st.(type) {
 	case CreateTable:
 		return e.create(s)

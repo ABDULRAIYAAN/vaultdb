@@ -6,7 +6,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.5.0: Milestone 5 complete.** VaultDB speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v0.6.0: Milestone 6 complete.** VaultDB runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -17,7 +17,7 @@ go run ./cmd/vaultdb
 ```
 
 ```
-VaultDB 0.5.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.6.0. Type HELP for commands, EXIT to quit.
 Loaded 0 keys from data/vaultdb.log (0 log records).
 vaultdb> SET name raiyaan
 OK
@@ -30,7 +30,7 @@ Bye.
 Start it again and the data is still there:
 
 ```
-VaultDB 0.5.0. Type HELP for commands, EXIT to quit.
+VaultDB 0.6.0. Type HELP for commands, EXIT to quit.
 Loaded 2 keys from data/vaultdb.log (2 log records).
 vaultdb> GET name
 "raiyaan"
@@ -51,6 +51,41 @@ Run the tests (the `-race` flag checks for concurrency bugs; on Windows it needs
 ```bash
 go test -race ./...
 ```
+
+## Running as a server
+
+```bash
+go run ./cmd/vaultdb -serve :7379          # terminal 1: the server
+go run ./cmd/vaultdb-cli                   # terminal 2: interactive client
+go run ./cmd/vaultdb-cli -c "GET name"     # one command, for scripts
+```
+
+On Windows, double-click `server.bat`, then `cli.bat` (open several to see many clients at once).
+
+```
+localhost:7379> SET name raiyaan
+OK
+localhost:7379> GET name
+"raiyaan"
+```
+
+### The protocol
+
+Plain TCP, simple enough to use from any language:
+
+```
+client -> server   one command per line            SET name raiyaan\n
+server -> client   reply length, newline, reply    2\nOK
+```
+
+Sending the length first means a reply can contain newlines (like a SQL result table) and the client still knows exactly where it ends, the same idea as Redis's bulk strings. `PING` answers `PONG`; `QUIT` closes the connection.
+
+### How it handles many clients
+
+- **One goroutine per client.** Goroutines are Go's lightweight threads, so hundreds of clients cost little. The store's read/write lock keeps their reads and writes safe.
+- **SQL statements run one at a time.** An `INSERT` checks that a primary key is free and then writes the row. Without serialising, two clients could both see the key as free and both write it. A test runs 50 clients racing to insert the same 20 ids and checks each id is inserted exactly once.
+- **Protection against bad clients:** commands over 1 MB are rejected without buffering them, silent clients are disconnected after 5 minutes, and connections are capped at 1,000.
+- **Graceful shutdown:** Ctrl+C stops accepting new clients, lets running commands finish, disconnects everyone, then closes the log file cleanly.
 
 ## SQL
 
@@ -134,6 +169,9 @@ vaultdb/
   internal/store/     the data: B-tree in memory, write-ahead rule, compaction
   internal/btree/     sorted in-memory index: insert with splits, delete with borrow/merge, range walks
   internal/sql/       SQL lexer, recursive descent parser, AST, executor, result tables
+  internal/server/    TCP server: goroutine per client, length-prefixed replies, limits, graceful shutdown
+  internal/client/    Go client library for the protocol
+  cmd/vaultdb-cli/    command-line client (interactive or one-shot with -c)
   internal/aol/       the log file: record format, checksums, append, replay, crash recovery, atomic rewrite
 ```
 
@@ -199,7 +237,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 3. Crash recovery (checksums) and log compaction
 - [x] 4. Indexing: B-tree for sorted keys, range and prefix queries
 - [x] 5. A small SQL-like query language (`CREATE TABLE`, `INSERT`, `SELECT ... WHERE`, `UPDATE`, `DELETE`)
-- [ ] 6. TCP server so multiple clients can connect
+- [x] 6. TCP server so multiple clients can connect
 - [ ] 7. Vector search: store embeddings, nearest-neighbour queries (brute force, then HNSW)
 - [ ] 8. Benchmarks
 

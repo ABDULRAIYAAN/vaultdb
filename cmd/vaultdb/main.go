@@ -10,24 +10,31 @@
 //	vaultdb -repair                 start even if the log is damaged, keeping
 //	                                everything before the damage
 //	vaultdb -autocompact=false      never compact automatically
+//	vaultdb -serve :7379            run as a network server instead of a shell;
+//	                                connect with vaultdb-cli
 package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ABDULRAIYAAN/vaultdb/internal/aol"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/engine"
+	"github.com/ABDULRAIYAAN/vaultdb/internal/server"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/store"
 )
 
-const version = "0.5.0"
+const version = "0.6.0"
 
 func main() {
 	dataPath := flag.String("data", filepath.Join("data", "vaultdb.log"), "log file to store data in")
@@ -35,6 +42,7 @@ func main() {
 	noSync := flag.Bool("nosync", false, "skip fsync after each write (faster, less safe)")
 	repair := flag.Bool("repair", false, "start even if the log is corrupt, keeping the data before the damage")
 	autoCompact := flag.Bool("autocompact", true, "compact the log automatically when it is mostly garbage")
+	serveAddr := flag.String("serve", "", "run as a network server on this address, e.g. :7379")
 	flag.Parse()
 
 	opts := store.DefaultOptions()
@@ -49,6 +57,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, "The log file is damaged. Back it up, then run with -repair to keep everything before the damage.")
 		}
 		os.Exit(1)
+	}
+
+	if *serveAddr != "" {
+		os.Exit(serve(db, banner, *serveAddr))
 	}
 
 	// Ctrl+C: close the log cleanly before exiting.
@@ -94,6 +106,44 @@ func main() {
 		fmt.Fprintln(os.Stderr, "read error:", err)
 		os.Exit(1)
 	}
+}
+
+// serve runs the network server until Ctrl+C, then shuts down cleanly:
+// stop accepting clients, let running commands finish, close the log.
+func serve(db *store.Store, banner, addr string) int {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "could not listen:", err)
+		db.Close()
+		return 1
+	}
+	logger := log.New(os.Stdout, "", log.LstdFlags)
+	srv := server.New(engine.New(db), server.Options{Logger: logger})
+
+	fmt.Printf("VaultDB %s server\n%s\n", version, banner)
+	logger.Printf("listening on %s (connect with: vaultdb-cli -addr %s). Press Ctrl+C to stop.", ln.Addr(), ln.Addr())
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt)
+	go func() {
+		<-stop
+		logger.Print("shutting down...")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
+
+	err = srv.Serve(ln)
+	if cerr := db.Close(); cerr != nil {
+		logger.Print("error closing database: ", cerr)
+		return 1
+	}
+	if err != server.ErrServerClosed {
+		logger.Print("server error: ", err)
+		return 1
+	}
+	logger.Print("stopped cleanly")
+	return 0
 }
 
 // openStore opens the right kind of store and returns a one-line description.
