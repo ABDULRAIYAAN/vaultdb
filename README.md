@@ -8,7 +8,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -237,7 +237,21 @@ vaultdb> SELECT name, gpa FROM students WHERE gpa > 3.5 ORDER BY gpa DESC
 (2 rows)
 ```
 
-Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, `COUNT(*)`, `WHERE`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL` and brackets.
+Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, aggregates, `WHERE`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL` and brackets.
+
+### Aggregate functions
+
+```
+vaultdb> SELECT COUNT(*), AVG(gpa), MIN(gpa), MAX(name) FROM students
++-------+--------------------+----------+-----------+
+| count | avg(gpa)           | min(gpa) | max(name) |
++-------+--------------------+----------+-----------+
+| 3     | 3.5666666666666664 | 3.2      | 'Sara'    |
++-------+--------------------+----------+-----------+
+(1 row)
+```
+
+`COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)` and `MAX(col)` boil the rows matched by `WHERE` down to one row. They follow standard SQL: `NULL`s are skipped, `COUNT` of nothing is 0 and the others give `NULL`. `SUM` and `AVG` need an `INT` or `FLOAT` column; `MIN` and `MAX` work on any type. `SUM` of an `INT` column is exact and reports an error instead of silently wrapping around if it overflows. Columns and aggregates can't be mixed in one `SELECT` until `GROUP BY` exists. `SUM`, `AVG`, `MIN` and `MAX` are not reserved words, so a column can still be called `max`.
 
 ### How SQL runs
 

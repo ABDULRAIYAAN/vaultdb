@@ -1,5 +1,7 @@
 package sql
 
+import "strings"
+
 // The AST ("abstract syntax tree") is what a query means, with the spelling
 // thrown away. "select NAME  from Students" and "SELECT name FROM students"
 // both become Select{Columns: [name], Table: students}.
@@ -44,14 +46,34 @@ type Insert struct {
 }
 
 // Select: SELECT name, age FROM students WHERE age > 20 ORDER BY age DESC LIMIT 5
+//
+// A select list is either plain columns (or *) or aggregate functions, never
+// both: without GROUP BY there is no way to say which row's name should sit
+// next to SUM(gpa).
 type Select struct {
-	Columns []string // empty means *
-	Count   bool     // SELECT COUNT(*)
-	Table   string
-	Where   Expr // nil means every row
-	OrderBy string
-	Desc    bool
-	Limit   int // -1 means no limit
+	Columns    []string    // empty (with no Aggregates) means *
+	Aggregates []Aggregate // SELECT COUNT(*), AVG(gpa): one result row
+	Table      string
+	Where      Expr // nil means every row
+	OrderBy    string
+	Desc       bool
+	Limit      int // -1 means no limit
+}
+
+// Aggregate is one function in a select list that boils many rows down to
+// one value: COUNT(*), COUNT(col), SUM(col), AVG(col), MIN(col) or MAX(col).
+type Aggregate struct {
+	Func   string // COUNT, SUM, AVG, MIN or MAX
+	Column string // "" means * (only for COUNT)
+}
+
+// Name is the aggregate's column heading in a result: "count" for COUNT(*),
+// otherwise like "avg(gpa)".
+func (a Aggregate) Name() string {
+	if a.Column == "" {
+		return "count"
+	}
+	return strings.ToLower(a.Func) + "(" + a.Column + ")"
 }
 
 // Assignment is one "col = value" inside UPDATE ... SET.

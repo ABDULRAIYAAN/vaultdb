@@ -16,7 +16,8 @@ import (
 //	DROP TABLE t
 //	SHOW TABLES
 //	INSERT INTO t [(col, ...)] VALUES (expr, ...), ...
-//	SELECT * | COUNT(*) | col, ... FROM t [WHERE expr]
+//	SELECT * | col, ... | agg, ... FROM t [WHERE expr]
+//	       agg: COUNT(*) COUNT(col) SUM(col) AVG(col) MIN(col) MAX(col)
 //	       [ORDER BY col [ASC|DESC]] [LIMIT n]
 //	UPDATE t SET col = expr, ... [WHERE expr]
 //	DELETE FROM t [WHERE expr]
@@ -231,21 +232,10 @@ func (p *parser) insertStmt() (Statement, error) {
 func (p *parser) selectStmt() (Statement, error) {
 	p.next() // SELECT
 	st := Select{Limit: -1}
-	switch {
-	case p.acceptSymbol("*"):
-	case p.acceptKeyword("COUNT"):
-		for _, s := range []string{"(", "*", ")"} {
-			if err := p.expectSymbol(s); err != nil {
-				return nil, err
-			}
-		}
-		st.Count = true
-	default:
-		cols, err := p.identList("column")
-		if err != nil {
+	if !p.acceptSymbol("*") {
+		if err := p.selectList(&st); err != nil {
 			return nil, err
 		}
-		st.Columns = cols
 	}
 	if err := p.expectKeyword("FROM"); err != nil {
 		return nil, err
@@ -280,6 +270,62 @@ func (p *parser) selectStmt() (Statement, error) {
 		st.Limit = n
 	}
 	return st, nil
+}
+
+// aggregateFuncs are the functions allowed in a select list. Only COUNT is a
+// keyword; SUM, AVG, MIN and MAX are recognised by the "(" after them, so
+// they can still be used as column names (a column called max is fine).
+var aggregateFuncs = map[string]bool{"COUNT": true, "SUM": true, "AVG": true, "MIN": true, "MAX": true}
+
+func (p *parser) atAggregate() bool {
+	t := p.peek()
+	if t.Kind == TokKeyword && t.Text == "COUNT" {
+		return true
+	}
+	if t.Kind != TokIdent || !aggregateFuncs[strings.ToUpper(t.Text)] {
+		return false
+	}
+	after := p.toks[p.pos+1] // safe: the last token is always TokEOF
+	return after.Kind == TokSymbol && after.Text == "("
+}
+
+// selectList reads "name, gpa" or "COUNT(*), AVG(gpa)" into st.
+func (p *parser) selectList(st *Select) error {
+	for {
+		if p.atAggregate() {
+			agg := Aggregate{Func: strings.ToUpper(p.next().Text)}
+			if err := p.expectSymbol("("); err != nil {
+				return err
+			}
+			if p.acceptSymbol("*") {
+				if agg.Func != "COUNT" {
+					return p.errorf("%s(*) is not allowed; only COUNT can take *", agg.Func)
+				}
+			} else {
+				col, err := p.expectIdent("column")
+				if err != nil {
+					return err
+				}
+				agg.Column = col
+			}
+			if err := p.expectSymbol(")"); err != nil {
+				return err
+			}
+			st.Aggregates = append(st.Aggregates, agg)
+		} else {
+			col, err := p.expectIdent("column")
+			if err != nil {
+				return err
+			}
+			st.Columns = append(st.Columns, col)
+		}
+		if len(st.Columns) > 0 && len(st.Aggregates) > 0 {
+			return fmt.Errorf("a select list cannot mix columns with aggregate functions (GROUP BY is not supported yet)")
+		}
+		if !p.acceptSymbol(",") {
+			return nil
+		}
+	}
 }
 
 func (p *parser) updateStmt() (Statement, error) {

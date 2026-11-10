@@ -57,7 +57,12 @@ func TestParse(t *testing.T) {
 			Insert{Table: "students", Columns: []string{"name", "id"}, Rows: [][]Expr{{lit("Raiyaan"), lit(int64(3))}}}},
 		{`SELECT * FROM students`, Select{Table: "students", Limit: -1}},
 		{`SELECT COUNT(*) FROM students WHERE active = TRUE`,
-			Select{Count: true, Table: "students", Where: bin("=", col("active"), lit(true)), Limit: -1}},
+			Select{Aggregates: []Aggregate{{Func: "COUNT"}}, Table: "students", Where: bin("=", col("active"), lit(true)), Limit: -1}},
+		{`select count(name), Sum(gpa), avg(gpa), MIN(id), max(id) FROM students`,
+			Select{Aggregates: []Aggregate{{"COUNT", "name"}, {"SUM", "gpa"}, {"AVG", "gpa"}, {"MIN", "id"}, {"MAX", "id"}},
+				Table: "students", Limit: -1}},
+		// Without a "(" after it, max is just a column name.
+		{`SELECT min, max FROM t`, Select{Columns: []string{"min", "max"}, Table: "t", Limit: -1}},
 		{`SELECT name, gpa FROM students WHERE gpa > 3 ORDER BY gpa DESC LIMIT 5`,
 			Select{Columns: []string{"name", "gpa"}, Table: "students", Where: bin(">", col("gpa"), lit(int64(3))),
 				OrderBy: "gpa", Desc: true, Limit: 5}},
@@ -115,7 +120,12 @@ func TestParseErrors(t *testing.T) {
 		`SELECT * FROM t LIMIT ten`:         "LIMIT needs a whole number",
 		`SELECT * FROM t WHERE a = 1 extra`: "after the end",
 		`SELECT * FROM t WHERE a = 99999999999999999999`: "too big",
-		`UPDATE t SET a 1`: `expected "="`,
+		`UPDATE t SET a 1`:             `expected "="`,
+		`SELECT SUM(*) FROM t`:         "only COUNT can take *",
+		`SELECT name, COUNT(*) FROM t`: "cannot mix columns with aggregate",
+		`SELECT AVG(gpa), name FROM t`: "cannot mix columns with aggregate",
+		`SELECT MAX(gpa FROM t`:        `expected ")"`,
+		`SELECT COUNT() FROM t`:        "expected column name",
 	}
 	for q, wantMsg := range cases {
 		_, err := Parse(q)

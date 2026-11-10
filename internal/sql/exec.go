@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -380,6 +381,10 @@ func (e *Executor) selectRows(sel Select) (Result, error) {
 		return Result{}, err
 	}
 
+	if len(sel.Aggregates) > 0 {
+		return aggregateRows(sel, s, rows)
+	}
+
 	if sel.OrderBy != "" {
 		i := s.index(sel.OrderBy)
 		if i < 0 {
@@ -395,10 +400,6 @@ func (e *Executor) selectRows(sel Select) (Result, error) {
 	}
 	if sel.Limit >= 0 && len(rows) > sel.Limit {
 		rows = rows[:sel.Limit]
-	}
-
-	if sel.Count {
-		return Result{Columns: []string{"count"}, Rows: [][]any{{int64(len(rows))}}}, nil
 	}
 
 	pick := make([]int, 0, len(s.Columns))
@@ -426,6 +427,95 @@ func (e *Executor) selectRows(sel Select) (Result, error) {
 		res.Rows = append(res.Rows, out)
 	}
 	return res, nil
+}
+
+// aggregateRows boils the matching rows down to one result row, one value
+// per aggregate. It follows standard SQL: NULLs are skipped, and SUM, AVG,
+// MIN and MAX of no values are NULL (COUNT of nothing is 0). LIMIT applies to
+// the single result row, not to the rows being counted.
+func aggregateRows(sel Select, s *schema, rows []storedRow) (Result, error) {
+	if sel.OrderBy != "" {
+		return Result{}, fmt.Errorf("ORDER BY cannot be used with aggregate functions: they return a single row")
+	}
+	res := Result{Columns: make([]string, len(sel.Aggregates))}
+	out := make([]any, len(sel.Aggregates))
+	for j, a := range sel.Aggregates {
+		res.Columns[j] = a.Name()
+		v, err := aggregate(a, sel.Table, s, rows)
+		if err != nil {
+			return Result{}, err
+		}
+		out[j] = v
+	}
+	if sel.Limit != 0 {
+		res.Rows = [][]any{out}
+	}
+	return res, nil
+}
+
+func aggregate(a Aggregate, table string, s *schema, rows []storedRow) (any, error) {
+	if a.Column == "" { // COUNT(*)
+		return int64(len(rows)), nil
+	}
+	i := s.index(a.Column)
+	if i < 0 {
+		return nil, fmt.Errorf("table %s has no column %s", table, a.Column)
+	}
+	c := s.Columns[i]
+	numeric := c.Type == TypeInt || c.Type == TypeFloat
+	if (a.Func == "SUM" || a.Func == "AVG") && !numeric {
+		return nil, fmt.Errorf("%s needs an INT or FLOAT column, but %s is %s", a.Func, c.Name, c.Type)
+	}
+
+	var (
+		count  int64
+		sumInt int64   // exact running total for INT columns
+		sumF   float64 // running total for FLOAT columns and for AVG
+		best   any     // current MIN or MAX
+	)
+	for _, r := range rows {
+		v := r.vals[i]
+		if v == nil {
+			continue
+		}
+		count++
+		switch a.Func {
+		case "SUM", "AVG":
+			f, _ := toFloat(v)
+			sumF += f
+			if n, ok := v.(int64); ok && a.Func == "SUM" {
+				if (n > 0 && sumInt > math.MaxInt64-n) || (n < 0 && sumInt < math.MinInt64-n) {
+					return nil, fmt.Errorf("SUM(%s) is too large for an INT", c.Name)
+				}
+				sumInt += n
+			}
+		case "MIN":
+			if best == nil || compareForSort(v, best) < 0 {
+				best = v
+			}
+		case "MAX":
+			if best == nil || compareForSort(v, best) > 0 {
+				best = v
+			}
+		}
+	}
+
+	switch a.Func {
+	case "COUNT":
+		return count, nil
+	case "MIN", "MAX":
+		return best, nil
+	}
+	if count == 0 {
+		return nil, nil // SUM or AVG of no values
+	}
+	if a.Func == "AVG" {
+		return sumF / float64(count), nil
+	}
+	if c.Type == TypeInt {
+		return sumInt, nil
+	}
+	return sumF, nil
 }
 
 func (e *Executor) update(u Update) (Result, error) {

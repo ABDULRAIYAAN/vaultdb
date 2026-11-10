@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"math"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -61,6 +62,69 @@ func TestSelect(t *testing.T) {
 		if got := rows(t, e, c.q); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("%s\n got %v\nwant %v", c.q, got, c.want)
 		}
+	}
+}
+
+func TestAggregates(t *testing.T) {
+	e := setup(t) // gpa: 3.9, 3.2, 3.6 and one NULL
+	cases := []struct {
+		q    string
+		cols []string
+		want [][]any
+	}{
+		{`SELECT COUNT(*), COUNT(gpa) FROM students`, []string{"count", "count(gpa)"}, [][]any{{int64(4), int64(3)}}},
+		{`SELECT SUM(id), MIN(id), MAX(id) FROM students`, []string{"sum(id)", "min(id)", "max(id)"},
+			[][]any{{int64(1), int64(-5), int64(3)}}}, // -5 + 1 + 2 + 3
+		{`SELECT MIN(gpa), MAX(gpa) FROM students`, []string{"min(gpa)", "max(gpa)"}, [][]any{{3.2, 3.9}}}, // NULL skipped
+		{`SELECT MIN(name), MAX(name) FROM students`, []string{"min(name)", "max(name)"}, [][]any{{"Ali", "Sara"}}},
+		{`SELECT COUNT(*), AVG(id) FROM students WHERE active = TRUE`, []string{"count", "avg(id)"}, [][]any{{int64(2), 2.0}}},
+		// No matching rows: COUNT is 0, everything else is NULL.
+		{`SELECT COUNT(*), SUM(gpa), AVG(gpa), MIN(name) FROM students WHERE id > 100`,
+			[]string{"count", "sum(gpa)", "avg(gpa)", "min(name)"}, [][]any{{int64(0), nil, nil, nil}}},
+		// Only NULLs: same as no values.
+		{`SELECT COUNT(gpa), SUM(gpa) FROM students WHERE id = -5`, []string{"count(gpa)", "sum(gpa)"}, [][]any{{int64(0), nil}}},
+		// LIMIT applies to the one result row, not to the rows being counted.
+		{`SELECT COUNT(*) FROM students LIMIT 1`, []string{"count"}, [][]any{{int64(4)}}},
+		{`SELECT COUNT(*) FROM students LIMIT 0`, []string{"count"}, nil},
+	}
+	for _, c := range cases {
+		r := mustExec(t, e, c.q)
+		if !reflect.DeepEqual(r.Columns, c.cols) || !reflect.DeepEqual(r.Rows, c.want) {
+			t.Errorf("%s\n got %v %v\nwant %v %v", c.q, r.Columns, r.Rows, c.cols, c.want)
+		}
+	}
+
+	// Floating-point sums are not exact, so check them with a tolerance.
+	r := mustExec(t, e, `SELECT SUM(gpa), AVG(gpa) FROM students`)
+	sum, avg := r.Rows[0][0].(float64), r.Rows[0][1].(float64)
+	if math.Abs(sum-10.7) > 1e-9 || math.Abs(avg-10.7/3) > 1e-9 {
+		t.Errorf("SUM, AVG of gpa = %v, %v; want 10.7, %v", sum, avg, 10.7/3)
+	}
+
+	bad := map[string]string{
+		`SELECT SUM(name) FROM students`:               "SUM needs an INT or FLOAT column, but name is TEXT",
+		`SELECT AVG(active) FROM students`:             "AVG needs an INT or FLOAT column",
+		`SELECT MAX(nope) FROM students`:               "no column nope",
+		`SELECT MAX(nope) FROM students WHERE id > 99`: "no column nope", // reported even with no rows
+		`SELECT COUNT(*) FROM students ORDER BY id`:    "ORDER BY cannot be used with aggregate",
+	}
+	for q, msg := range bad {
+		if _, err := e.Exec(q); err == nil || !strings.Contains(err.Error(), msg) {
+			t.Errorf("%s\n error %v, want %q", q, err, msg)
+		}
+	}
+}
+
+func TestSumOverflow(t *testing.T) {
+	e := NewExecutor(store.New())
+	mustExec(t, e, `CREATE TABLE big (n INT)`)
+	mustExec(t, e, `INSERT INTO big VALUES (9223372036854775807), (1)`)
+	if _, err := e.Exec(`SELECT SUM(n) FROM big`); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("overflowing SUM: error %v", err)
+	}
+	// AVG adds up in floating point, so it does not overflow.
+	if got := rows(t, e, `SELECT AVG(n) FROM big`); got[0][0].(float64) < 4e18 {
+		t.Fatalf("AVG = %v", got)
 	}
 }
 
