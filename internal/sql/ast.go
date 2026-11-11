@@ -47,17 +47,50 @@ type Insert struct {
 
 // Select: SELECT name, age FROM students WHERE age > 20 ORDER BY age DESC LIMIT 5
 //
-// A select list is either plain columns (or *) or aggregate functions, never
-// both: without GROUP BY there is no way to say which row's name should sit
-// next to SUM(gpa).
+// The select list can hold plain columns, aggregate functions, or both. With
+// aggregates and no GROUP BY, all matching rows become one result row. With
+// GROUP BY, rows that share the same values in the GROUP BY columns become
+// one result row each:
+//
+//	SELECT dept, COUNT(*), AVG(gpa) FROM students GROUP BY dept
+//
+// A plain column next to an aggregate must be listed in GROUP BY, otherwise
+// there is no single value to show for it (which row's name goes next to
+// SUM(gpa)?). The parser enforces that.
 type Select struct {
-	Columns    []string    // empty (with no Aggregates) means *
-	Aggregates []Aggregate // SELECT COUNT(*), AVG(gpa): one result row
-	Table      string
-	Where      Expr // nil means every row
-	OrderBy    string
-	Desc       bool
-	Limit      int // -1 means no limit
+	Items    []SelectItem // empty means *
+	Table    string
+	Where    Expr       // nil means every row
+	GroupBy  []string   // empty means no grouping
+	OrderBy  string     // a column to sort by, or ""
+	OrderAgg *Aggregate // ORDER BY COUNT(*): sort groups by an aggregate instead
+	Desc     bool
+	Limit    int // -1 means no limit
+}
+
+// SelectItem is one entry in a select list: either a plain column or an
+// aggregate function (Agg is set and Column is empty).
+type SelectItem struct {
+	Column string
+	Agg    *Aggregate
+}
+
+// Name is the item's column heading in a result.
+func (it SelectItem) Name() string {
+	if it.Agg != nil {
+		return it.Agg.Name()
+	}
+	return it.Column
+}
+
+// HasAggregates reports whether any select list entry is an aggregate.
+func (s Select) HasAggregates() bool {
+	for _, it := range s.Items {
+		if it.Agg != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // Aggregate is one function in a select list that boils many rows down to

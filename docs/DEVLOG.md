@@ -16,3 +16,19 @@ How it works:
 - Mixing plain columns with aggregates is rejected with a clear message until `GROUP BY` exists, and so is `ORDER BY` (there's only one result row).
 
 One behaviour change: `LIMIT` used to cut the rows *before* `COUNT(*)` counted them, so `SELECT COUNT(*) FROM t LIMIT 2` said 2 even with 100 rows. It now applies to the result row, as in Postgres and SQLite.
+
+## 2026-11-11: GROUP BY
+
+Added `GROUP BY` to `SELECT`, so aggregates can be split per group: `SELECT dept, COUNT(*), AVG(gpa) FROM students GROUP BY dept`. `ORDER BY` can now sort by an aggregate too (`ORDER BY COUNT(*) DESC`), which is how you get "top N" style answers.
+
+Why: yesterday's aggregates could only summarise a whole table. "How many per department?" or "which category has the highest average?" are the questions people actually ask, and you couldn't answer them without running one query per value.
+
+How it works:
+
+- The AST's separate `Columns` and `Aggregates` lists became a single `Items []SelectItem`, because a select list can now mix both and the result has to keep the order they were written in.
+- The parser checks the one rule that needs no schema: a plain column next to an aggregate must be in `GROUP BY`. It also rejects `SELECT *` with `GROUP BY` and a column listed twice.
+- The executor buckets the matching rows in a map keyed by the JSON text of their `GROUP BY` values (each column has one type, so equal values always give equal text). NULLs land in the same bucket, as in standard SQL. Groups are then sorted by their keys so the output is deterministic, re-sorted if there's an `ORDER BY`, and cut by `LIMIT`.
+- Column and type checks for aggregates moved into `checkAggregate`, which runs before any rows are touched, so a typo is reported even when no rows (and so no groups) match.
+- An aggregate query without `GROUP BY` is just the one-group case of the same code, so it still always returns exactly one row.
+
+`GROUP` is now a reserved word, so a column can't be called `group` any more. Next up is `HAVING`, to filter groups after they're aggregated.

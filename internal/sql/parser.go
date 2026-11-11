@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -16,9 +17,10 @@ import (
 //	DROP TABLE t
 //	SHOW TABLES
 //	INSERT INTO t [(col, ...)] VALUES (expr, ...), ...
-//	SELECT * | col, ... | agg, ... FROM t [WHERE expr]
-//	       agg: COUNT(*) COUNT(col) SUM(col) AVG(col) MIN(col) MAX(col)
-//	       [ORDER BY col [ASC|DESC]] [LIMIT n]
+//	SELECT * | item, ... FROM t [WHERE expr] [GROUP BY col, ...]
+//	       [ORDER BY col|agg [ASC|DESC]] [LIMIT n]
+//	       item: col | agg
+//	       agg:  COUNT(*) COUNT(col) SUM(col) AVG(col) MIN(col) MAX(col)
 //	UPDATE t SET col = expr, ... [WHERE expr]
 //	DELETE FROM t [WHERE expr]
 //
@@ -247,11 +249,28 @@ func (p *parser) selectStmt() (Statement, error) {
 	if st.Where, err = p.optionalWhere(); err != nil {
 		return nil, err
 	}
+	if p.acceptKeyword("GROUP") {
+		if err := p.expectKeyword("BY"); err != nil {
+			return nil, err
+		}
+		if st.GroupBy, err = p.identList("column"); err != nil {
+			return nil, err
+		}
+	}
+	if err := checkGrouping(st); err != nil {
+		return nil, err
+	}
 	if p.acceptKeyword("ORDER") {
 		if err := p.expectKeyword("BY"); err != nil {
 			return nil, err
 		}
-		if st.OrderBy, err = p.expectIdent("column"); err != nil {
+		if p.atAggregate() {
+			agg, err := p.aggregate()
+			if err != nil {
+				return nil, err
+			}
+			st.OrderAgg = &agg
+		} else if st.OrderBy, err = p.expectIdent("column"); err != nil {
 			return nil, err
 		}
 		if p.acceptKeyword("DESC") {
@@ -289,43 +308,78 @@ func (p *parser) atAggregate() bool {
 	return after.Kind == TokSymbol && after.Text == "("
 }
 
-// selectList reads "name, gpa" or "COUNT(*), AVG(gpa)" into st.
+// selectList reads "name, gpa", "COUNT(*), AVG(gpa)" or a mix of both into st.
 func (p *parser) selectList(st *Select) error {
 	for {
 		if p.atAggregate() {
-			agg := Aggregate{Func: strings.ToUpper(p.next().Text)}
-			if err := p.expectSymbol("("); err != nil {
+			agg, err := p.aggregate()
+			if err != nil {
 				return err
 			}
-			if p.acceptSymbol("*") {
-				if agg.Func != "COUNT" {
-					return p.errorf("%s(*) is not allowed; only COUNT can take *", agg.Func)
-				}
-			} else {
-				col, err := p.expectIdent("column")
-				if err != nil {
-					return err
-				}
-				agg.Column = col
-			}
-			if err := p.expectSymbol(")"); err != nil {
-				return err
-			}
-			st.Aggregates = append(st.Aggregates, agg)
+			st.Items = append(st.Items, SelectItem{Agg: &agg})
 		} else {
 			col, err := p.expectIdent("column")
 			if err != nil {
 				return err
 			}
-			st.Columns = append(st.Columns, col)
-		}
-		if len(st.Columns) > 0 && len(st.Aggregates) > 0 {
-			return fmt.Errorf("a select list cannot mix columns with aggregate functions (GROUP BY is not supported yet)")
+			st.Items = append(st.Items, SelectItem{Column: col})
 		}
 		if !p.acceptSymbol(",") {
 			return nil
 		}
 	}
+}
+
+// aggregate reads one function call such as COUNT(*) or AVG(gpa).
+func (p *parser) aggregate() (Aggregate, error) {
+	agg := Aggregate{Func: strings.ToUpper(p.next().Text)}
+	if err := p.expectSymbol("("); err != nil {
+		return agg, err
+	}
+	if p.acceptSymbol("*") {
+		if agg.Func != "COUNT" {
+			return agg, p.errorf("%s(*) is not allowed; only COUNT can take *", agg.Func)
+		}
+	} else {
+		col, err := p.expectIdent("column")
+		if err != nil {
+			return agg, err
+		}
+		agg.Column = col
+	}
+	return agg, p.expectSymbol(")")
+}
+
+// checkGrouping enforces the one GROUP BY rule that needs no table schema:
+// a plain column in the select list of a grouped or aggregated query must be
+// one of the GROUP BY columns, because every row of a group shares its value.
+func checkGrouping(st Select) error {
+	if len(st.GroupBy) == 0 {
+		if st.HasAggregates() {
+			for _, it := range st.Items {
+				if it.Agg == nil {
+					return fmt.Errorf("column %s must be listed in GROUP BY to be selected next to an aggregate function", it.Column)
+				}
+			}
+		}
+		return nil
+	}
+	if len(st.Items) == 0 {
+		return errors.New("SELECT * cannot be used with GROUP BY; list the GROUP BY columns and aggregates instead")
+	}
+	grouped := map[string]bool{}
+	for _, g := range st.GroupBy {
+		if grouped[g] {
+			return fmt.Errorf("column %s is listed twice in GROUP BY", g)
+		}
+		grouped[g] = true
+	}
+	for _, it := range st.Items {
+		if it.Agg == nil && !grouped[it.Column] {
+			return fmt.Errorf("column %s must be listed in GROUP BY or used inside an aggregate function", it.Column)
+		}
+	}
+	return nil
 }
 
 func (p *parser) updateStmt() (Statement, error) {

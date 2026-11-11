@@ -39,6 +39,25 @@ func bin(op string, l, r Expr) Binary {
 	return Binary{Op: op, Left: l, Right: r}
 }
 
+// items builds a select list: "name" is a plain column, "AVG(gpa)" or
+// "COUNT(*)" an aggregate.
+func items(specs ...string) []SelectItem {
+	var out []SelectItem
+	for _, sp := range specs {
+		open := strings.IndexByte(sp, '(')
+		if open < 0 {
+			out = append(out, SelectItem{Column: sp})
+			continue
+		}
+		a := Aggregate{Func: sp[:open], Column: sp[open+1 : len(sp)-1]}
+		if a.Column == "*" {
+			a.Column = ""
+		}
+		out = append(out, SelectItem{Agg: &a})
+	}
+	return out
+}
+
 func TestParse(t *testing.T) {
 	cases := []struct {
 		q    string
@@ -57,14 +76,22 @@ func TestParse(t *testing.T) {
 			Insert{Table: "students", Columns: []string{"name", "id"}, Rows: [][]Expr{{lit("Raiyaan"), lit(int64(3))}}}},
 		{`SELECT * FROM students`, Select{Table: "students", Limit: -1}},
 		{`SELECT COUNT(*) FROM students WHERE active = TRUE`,
-			Select{Aggregates: []Aggregate{{Func: "COUNT"}}, Table: "students", Where: bin("=", col("active"), lit(true)), Limit: -1}},
+			Select{Items: items("COUNT(*)"), Table: "students", Where: bin("=", col("active"), lit(true)), Limit: -1}},
 		{`select count(name), Sum(gpa), avg(gpa), MIN(id), max(id) FROM students`,
-			Select{Aggregates: []Aggregate{{"COUNT", "name"}, {"SUM", "gpa"}, {"AVG", "gpa"}, {"MIN", "id"}, {"MAX", "id"}},
+			Select{Items: items("COUNT(name)", "SUM(gpa)", "AVG(gpa)", "MIN(id)", "MAX(id)"),
 				Table: "students", Limit: -1}},
 		// Without a "(" after it, max is just a column name.
-		{`SELECT min, max FROM t`, Select{Columns: []string{"min", "max"}, Table: "t", Limit: -1}},
+		{`SELECT min, max FROM t`, Select{Items: items("min", "max"), Table: "t", Limit: -1}},
+		{`SELECT dept, COUNT(*), AVG(gpa) FROM students WHERE active = TRUE GROUP BY dept`,
+			Select{Items: items("dept", "COUNT(*)", "AVG(gpa)"), Table: "students",
+				Where: bin("=", col("active"), lit(true)), GroupBy: []string{"dept"}, Limit: -1}},
+		{`SELECT COUNT(*), dept, year FROM t GROUP BY dept, year ORDER BY COUNT(*) DESC LIMIT 3`,
+			Select{Items: items("COUNT(*)", "dept", "year"), Table: "t", GroupBy: []string{"dept", "year"},
+				OrderAgg: &Aggregate{Func: "COUNT"}, Desc: true, Limit: 3}},
+		{`SELECT dept FROM t GROUP BY dept ORDER BY dept`,
+			Select{Items: items("dept"), Table: "t", GroupBy: []string{"dept"}, OrderBy: "dept", Limit: -1}},
 		{`SELECT name, gpa FROM students WHERE gpa > 3 ORDER BY gpa DESC LIMIT 5`,
-			Select{Columns: []string{"name", "gpa"}, Table: "students", Where: bin(">", col("gpa"), lit(int64(3))),
+			Select{Items: items("name", "gpa"), Table: "students", Where: bin(">", col("gpa"), lit(int64(3))),
 				OrderBy: "gpa", Desc: true, Limit: 5}},
 		{`SELECT * FROM t ORDER BY a ASC`, Select{Table: "t", OrderBy: "a", Limit: -1}},
 		{`UPDATE students SET gpa = 4.0, active = FALSE WHERE id = 1`,
@@ -120,12 +147,18 @@ func TestParseErrors(t *testing.T) {
 		`SELECT * FROM t LIMIT ten`:         "LIMIT needs a whole number",
 		`SELECT * FROM t WHERE a = 1 extra`: "after the end",
 		`SELECT * FROM t WHERE a = 99999999999999999999`: "too big",
-		`UPDATE t SET a 1`:             `expected "="`,
-		`SELECT SUM(*) FROM t`:         "only COUNT can take *",
-		`SELECT name, COUNT(*) FROM t`: "cannot mix columns with aggregate",
-		`SELECT AVG(gpa), name FROM t`: "cannot mix columns with aggregate",
-		`SELECT MAX(gpa FROM t`:        `expected ")"`,
-		`SELECT COUNT() FROM t`:        "expected column name",
+		`UPDATE t SET a 1`:                           `expected "="`,
+		`SELECT SUM(*) FROM t`:                       "only COUNT can take *",
+		`SELECT name, COUNT(*) FROM t`:               "name must be listed in GROUP BY",
+		`SELECT AVG(gpa), name FROM t`:               "name must be listed in GROUP BY",
+		`SELECT name, COUNT(*) FROM t GROUP BY dept`: "name must be listed in GROUP BY or used inside an aggregate",
+		`SELECT * FROM t GROUP BY dept`:              "SELECT * cannot be used with GROUP BY",
+		`SELECT dept FROM t GROUP BY dept, dept`:     "listed twice in GROUP BY",
+		`SELECT dept FROM t GROUP dept`:              "expected BY",
+		`SELECT dept FROM t GROUP BY`:                "expected column name",
+		`SELECT dept FROM t ORDER BY SUM(*)`:         "only COUNT can take *",
+		`SELECT MAX(gpa FROM t`:                      `expected ")"`,
+		`SELECT COUNT() FROM t`:                      "expected column name",
 	}
 	for q, wantMsg := range cases {
 		_, err := Parse(q)

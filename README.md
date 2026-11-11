@@ -8,7 +8,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) with `GROUP BY`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -237,7 +237,7 @@ vaultdb> SELECT name, gpa FROM students WHERE gpa > 3.5 ORDER BY gpa DESC
 (2 rows)
 ```
 
-Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, aggregates, `WHERE`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL` and brackets.
+Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, aggregates, `WHERE`, `GROUP BY`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL` and brackets.
 
 ### Aggregate functions
 
@@ -251,7 +251,32 @@ vaultdb> SELECT COUNT(*), AVG(gpa), MIN(gpa), MAX(name) FROM students
 (1 row)
 ```
 
-`COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)` and `MAX(col)` boil the rows matched by `WHERE` down to one row. They follow standard SQL: `NULL`s are skipped, `COUNT` of nothing is 0 and the others give `NULL`. `SUM` and `AVG` need an `INT` or `FLOAT` column; `MIN` and `MAX` work on any type. `SUM` of an `INT` column is exact and reports an error instead of silently wrapping around if it overflows. Columns and aggregates can't be mixed in one `SELECT` until `GROUP BY` exists. `SUM`, `AVG`, `MIN` and `MAX` are not reserved words, so a column can still be called `max`.
+`COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)` and `MAX(col)` boil the rows matched by `WHERE` down to one row. They follow standard SQL: `NULL`s are skipped, `COUNT` of nothing is 0 and the others give `NULL`. `SUM` and `AVG` need an `INT` or `FLOAT` column; `MIN` and `MAX` work on any type. `SUM` of an `INT` column is exact and reports an error instead of silently wrapping around if it overflows. `SUM`, `AVG`, `MIN` and `MAX` are not reserved words, so a column can still be called `max`.
+
+### GROUP BY
+
+```
+vaultdb> SELECT dept, COUNT(*), AVG(gpa), MAX(gpa) FROM students GROUP BY dept ORDER BY COUNT(*) DESC
++-----------+-------+----------+----------+
+| dept      | count | avg(gpa) | max(gpa) |
++-----------+-------+----------+----------+
+| 'cs'      | 2     | 3.75     | 3.9      |
+| 'math'    | 2     | 3.3      | 3.4      |
+| 'physics' | 1     | 3.1      | 3.1      |
++-----------+-------+----------+----------+
+(3 rows)
+```
+
+`GROUP BY col, ...` puts rows with the same values in those columns into one group and runs the aggregates once per group. The rules match standard SQL:
+
+- A plain column next to an aggregate must be listed in `GROUP BY` (otherwise which row's `name` would sit next to `COUNT(*)`?). The error says so.
+- `NULL`s count as equal when grouping, so all rows with no `dept` form one group.
+- `WHERE` filters rows before they are grouped; `LIMIT` counts groups.
+- `ORDER BY` can name a `GROUP BY` column or an aggregate (`ORDER BY COUNT(*) DESC`), even one that isn't selected. Without `ORDER BY`, groups come back sorted by their `GROUP BY` values.
+- `GROUP BY` with no aggregates lists each distinct value once, like `SELECT DISTINCT`.
+- With no matching rows, a grouped query returns no rows, while a plain `SELECT COUNT(*)` still returns one row saying 0.
+
+How it runs: each matching row is put in a bucket (a Go map) keyed by the JSON text of its `GROUP BY` values, then every aggregate walks the rows of each bucket. One pass to group, one per aggregate per group.
 
 ### How SQL runs
 

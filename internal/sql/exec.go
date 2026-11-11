@@ -381,8 +381,11 @@ func (e *Executor) selectRows(sel Select) (Result, error) {
 		return Result{}, err
 	}
 
-	if len(sel.Aggregates) > 0 {
-		return aggregateRows(sel, s, rows)
+	if sel.HasAggregates() || len(sel.GroupBy) > 0 {
+		return groupRows(sel, s, rows)
+	}
+	if sel.OrderAgg != nil {
+		return Result{}, fmt.Errorf("ORDER BY %s needs GROUP BY or aggregate functions in the select list", sel.OrderAgg.Name())
 	}
 
 	if sel.OrderBy != "" {
@@ -404,19 +407,19 @@ func (e *Executor) selectRows(sel Select) (Result, error) {
 
 	pick := make([]int, 0, len(s.Columns))
 	res := Result{}
-	if len(sel.Columns) == 0 {
+	if len(sel.Items) == 0 {
 		for i, c := range s.Columns {
 			pick = append(pick, i)
 			res.Columns = append(res.Columns, c.Name)
 		}
 	} else {
-		for _, name := range sel.Columns {
-			i := s.index(name)
+		for _, it := range sel.Items {
+			i := s.index(it.Column)
 			if i < 0 {
-				return Result{}, fmt.Errorf("table %s has no column %s", sel.Table, name)
+				return Result{}, fmt.Errorf("table %s has no column %s", sel.Table, it.Column)
 			}
 			pick = append(pick, i)
-			res.Columns = append(res.Columns, name)
+			res.Columns = append(res.Columns, it.Column)
 		}
 	}
 	for _, r := range rows {
@@ -429,43 +432,182 @@ func (e *Executor) selectRows(sel Select) (Result, error) {
 	return res, nil
 }
 
-// aggregateRows boils the matching rows down to one result row, one value
-// per aggregate. It follows standard SQL: NULLs are skipped, and SUM, AVG,
-// MIN and MAX of no values are NULL (COUNT of nothing is 0). LIMIT applies to
-// the single result row, not to the rows being counted.
-func aggregateRows(sel Select, s *schema, rows []storedRow) (Result, error) {
-	if sel.OrderBy != "" {
-		return Result{}, fmt.Errorf("ORDER BY cannot be used with aggregate functions: they return a single row")
+// group is the rows that share one combination of GROUP BY values.
+type group struct {
+	keys []any // the GROUP BY column values, in GROUP BY order
+	rows []storedRow
+}
+
+// groupRows answers a query with aggregates and/or GROUP BY.
+//
+// Without GROUP BY every matching row falls into a single group, so the
+// result is exactly one row, even when no rows matched (COUNT is then 0 and
+// the other aggregates NULL, as in standard SQL).
+//
+// With GROUP BY, rows are bucketed by their GROUP BY values: a map from an
+// encoding of those values to the group. NULLs count as equal here, so all
+// rows with a NULL dept form one group, again as in standard SQL. Groups come
+// back sorted by their GROUP BY values unless ORDER BY says otherwise, and
+// LIMIT counts groups, not the rows inside them.
+func groupRows(sel Select, s *schema, rows []storedRow) (Result, error) {
+	// Check every name up front, so a typo is reported even with no rows.
+	groupIdx := make([]int, len(sel.GroupBy))
+	for j, g := range sel.GroupBy {
+		if groupIdx[j] = s.index(g); groupIdx[j] < 0 {
+			return Result{}, fmt.Errorf("table %s has no column %s", sel.Table, g)
+		}
 	}
-	res := Result{Columns: make([]string, len(sel.Aggregates))}
-	out := make([]any, len(sel.Aggregates))
-	for j, a := range sel.Aggregates {
-		res.Columns[j] = a.Name()
-		v, err := aggregate(a, sel.Table, s, rows)
-		if err != nil {
+	for _, it := range sel.Items {
+		if it.Agg != nil {
+			if err := checkAggregate(*it.Agg, sel.Table, s); err != nil {
+				return Result{}, err
+			}
+		}
+	}
+	orderKey := -1 // which GROUP BY column ORDER BY names, if any
+	switch {
+	case sel.OrderAgg != nil:
+		if len(sel.GroupBy) == 0 {
+			return Result{}, fmt.Errorf("ORDER BY cannot be used with aggregate functions without GROUP BY: they return a single row")
+		}
+		if err := checkAggregate(*sel.OrderAgg, sel.Table, s); err != nil {
 			return Result{}, err
 		}
-		out[j] = v
+	case sel.OrderBy != "":
+		if len(sel.GroupBy) == 0 {
+			return Result{}, fmt.Errorf("ORDER BY cannot be used with aggregate functions without GROUP BY: they return a single row")
+		}
+		for j, g := range sel.GroupBy {
+			if g == sel.OrderBy {
+				orderKey = j
+			}
+		}
+		if orderKey < 0 {
+			return Result{}, fmt.Errorf("ORDER BY %s: a grouped query can only be sorted by a GROUP BY column or an aggregate", sel.OrderBy)
+		}
 	}
-	if sel.Limit != 0 {
-		res.Rows = [][]any{out}
+
+	var groups []*group
+	if len(sel.GroupBy) == 0 {
+		groups = []*group{{rows: rows}}
+	} else {
+		byKey := map[string]*group{}
+		for _, r := range rows {
+			keys := make([]any, len(groupIdx))
+			for j, i := range groupIdx {
+				keys[j] = r.vals[i]
+			}
+			// Each column has one type, so the JSON text of the values is a
+			// safe map key: equal values give equal text and vice versa.
+			raw, _ := json.Marshal(keys)
+			g := byKey[string(raw)]
+			if g == nil {
+				g = &group{keys: keys}
+				byKey[string(raw)] = g
+				groups = append(groups, g)
+			}
+			g.rows = append(g.rows, r)
+		}
+		sort.Slice(groups, func(a, b int) bool { return compareKeys(groups[a].keys, groups[b].keys) < 0 })
+	}
+
+	if sel.OrderAgg != nil || orderKey >= 0 {
+		sortBy := make([]any, len(groups))
+		for n, g := range groups {
+			if orderKey >= 0 {
+				sortBy[n] = g.keys[orderKey]
+				continue
+			}
+			v, err := aggregate(*sel.OrderAgg, s, g.rows)
+			if err != nil {
+				return Result{}, err
+			}
+			sortBy[n] = v
+		}
+		// Sort an index so the groups and their sort values move together.
+		perm := make([]int, len(groups))
+		for n := range perm {
+			perm[n] = n
+		}
+		sort.SliceStable(perm, func(a, b int) bool {
+			c := compareForSort(sortBy[perm[a]], sortBy[perm[b]])
+			if sel.Desc {
+				return c > 0
+			}
+			return c < 0
+		})
+		sorted := make([]*group, len(groups))
+		for n, p := range perm {
+			sorted[n] = groups[p]
+		}
+		groups = sorted
+	}
+	if sel.Limit >= 0 && len(groups) > sel.Limit {
+		groups = groups[:sel.Limit]
+	}
+
+	res := Result{Columns: make([]string, len(sel.Items))}
+	for j, it := range sel.Items {
+		res.Columns[j] = it.Name()
+	}
+	for _, g := range groups {
+		out := make([]any, len(sel.Items))
+		for j, it := range sel.Items {
+			if it.Agg == nil {
+				// The parser made sure this column is in GROUP BY.
+				for k, name := range sel.GroupBy {
+					if name == it.Column {
+						out[j] = g.keys[k]
+					}
+				}
+				continue
+			}
+			v, err := aggregate(*it.Agg, s, g.rows)
+			if err != nil {
+				return Result{}, err
+			}
+			out[j] = v
+		}
+		res.Rows = append(res.Rows, out)
 	}
 	return res, nil
 }
 
-func aggregate(a Aggregate, table string, s *schema, rows []storedRow) (any, error) {
+// compareKeys orders two lists of GROUP BY values column by column.
+func compareKeys(a, b []any) int {
+	for i := range a {
+		if c := compareForSort(a[i], b[i]); c != 0 {
+			return c
+		}
+	}
+	return 0
+}
+
+// checkAggregate makes sure an aggregate names a real column of a type it
+// can work on.
+func checkAggregate(a Aggregate, table string, s *schema) error {
+	if a.Column == "" { // COUNT(*)
+		return nil
+	}
+	i := s.index(a.Column)
+	if i < 0 {
+		return fmt.Errorf("table %s has no column %s", table, a.Column)
+	}
+	c := s.Columns[i]
+	if (a.Func == "SUM" || a.Func == "AVG") && c.Type != TypeInt && c.Type != TypeFloat {
+		return fmt.Errorf("%s needs an INT or FLOAT column, but %s is %s", a.Func, c.Name, c.Type)
+	}
+	return nil
+}
+
+// aggregate computes one aggregate over rows. checkAggregate must have
+// accepted a first.
+func aggregate(a Aggregate, s *schema, rows []storedRow) (any, error) {
 	if a.Column == "" { // COUNT(*)
 		return int64(len(rows)), nil
 	}
 	i := s.index(a.Column)
-	if i < 0 {
-		return nil, fmt.Errorf("table %s has no column %s", table, a.Column)
-	}
 	c := s.Columns[i]
-	numeric := c.Type == TypeInt || c.Type == TypeFloat
-	if (a.Func == "SUM" || a.Func == "AVG") && !numeric {
-		return nil, fmt.Errorf("%s needs an INT or FLOAT column, but %s is %s", a.Func, c.Name, c.Type)
-	}
 
 	var (
 		count  int64

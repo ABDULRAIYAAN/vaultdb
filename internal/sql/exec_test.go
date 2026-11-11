@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"fmt"
 	"math"
 	"path/filepath"
 	"reflect"
@@ -112,6 +113,118 @@ func TestAggregates(t *testing.T) {
 		if _, err := e.Exec(q); err == nil || !strings.Contains(err.Error(), msg) {
 			t.Errorf("%s\n error %v, want %q", q, err, msg)
 		}
+	}
+}
+
+func setupGroups(t *testing.T) *Executor {
+	t.Helper()
+	e := NewExecutor(store.New())
+	mustExec(t, e, `CREATE TABLE staff (id INT PRIMARY KEY, name TEXT, dept TEXT, year INT, salary INT)`)
+	mustExec(t, e, `INSERT INTO staff VALUES
+		(1, 'Ali',     'eng',   2024, 100),
+		(2, 'Sara',    'eng',   2025, 120),
+		(3, 'Raiyaan', 'eng',   2025, 140),
+		(4, 'Mei',     'sales', 2024, 80),
+		(5, 'Tom',     'sales', 2024, NULL),
+		(6, 'Zed',     NULL,    2025, 50)`)
+	return e
+}
+
+func TestGroupBy(t *testing.T) {
+	e := setupGroups(t)
+	cases := []struct {
+		q    string
+		cols []string
+		want [][]any
+	}{
+		// Groups come back sorted by their GROUP BY values, NULL first. All
+		// rows with a NULL dept form one group.
+		{`SELECT dept, COUNT(*), SUM(salary) FROM staff GROUP BY dept`,
+			[]string{"dept", "count", "sum(salary)"},
+			[][]any{{nil, int64(1), int64(50)}, {"eng", int64(3), int64(360)}, {"sales", int64(2), int64(80)}}},
+		// The select list keeps the order it was written in.
+		{`SELECT AVG(salary), dept FROM staff WHERE dept IS NOT NULL GROUP BY dept`,
+			[]string{"avg(salary)", "dept"}, [][]any{{120.0, "eng"}, {80.0, "sales"}}},
+		// Several GROUP BY columns: one group per combination.
+		{`SELECT dept, year, COUNT(*) FROM staff WHERE dept IS NOT NULL GROUP BY dept, year`,
+			[]string{"dept", "year", "count"},
+			[][]any{{"eng", int64(2024), int64(1)}, {"eng", int64(2025), int64(2)}, {"sales", int64(2024), int64(2)}}},
+		// GROUP BY without aggregates lists each distinct value once.
+		{`SELECT year FROM staff GROUP BY year`, []string{"year"}, [][]any{{int64(2024)}, {int64(2025)}}},
+		// A GROUP BY column does not have to be selected.
+		{`SELECT COUNT(*) FROM staff GROUP BY year`, []string{"count"}, [][]any{{int64(3)}, {int64(3)}}},
+		// ORDER BY an aggregate, then LIMIT the number of groups.
+		{`SELECT dept, MAX(salary) FROM staff GROUP BY dept ORDER BY MAX(salary) DESC LIMIT 2`,
+			[]string{"dept", "max(salary)"}, [][]any{{"eng", int64(140)}, {"sales", int64(80)}}},
+		// ORDER BY an aggregate that is not in the select list.
+		{`SELECT dept FROM staff GROUP BY dept ORDER BY COUNT(*)`,
+			[]string{"dept"}, [][]any{{nil}, {"sales"}, {"eng"}}},
+		{`SELECT dept, COUNT(*) FROM staff GROUP BY dept ORDER BY dept DESC`,
+			[]string{"dept", "count"}, [][]any{{"sales", int64(2)}, {"eng", int64(3)}, {nil, int64(1)}}},
+		// A group whose salaries are all NULL: COUNT(col) 0, SUM NULL.
+		{`SELECT name, COUNT(salary), SUM(salary) FROM staff WHERE id = 5 GROUP BY name`,
+			[]string{"name", "count(salary)", "sum(salary)"}, [][]any{{"Tom", int64(0), nil}}},
+		// No matching rows means no groups (unlike an aggregate without
+		// GROUP BY, which always returns one row).
+		{`SELECT dept, COUNT(*) FROM staff WHERE id > 100 GROUP BY dept`, []string{"dept", "count"}, nil},
+		{`SELECT COUNT(*) FROM staff WHERE id > 100`, []string{"count"}, [][]any{{int64(0)}}},
+		{`SELECT dept, COUNT(*) FROM staff GROUP BY dept LIMIT 0`, []string{"dept", "count"}, nil},
+	}
+	for _, c := range cases {
+		r := mustExec(t, e, c.q)
+		if !reflect.DeepEqual(r.Columns, c.cols) || !reflect.DeepEqual(r.Rows, c.want) {
+			t.Errorf("%s\n got %v %v\nwant %v %v", c.q, r.Columns, r.Rows, c.cols, c.want)
+		}
+	}
+
+	bad := map[string]string{
+		`SELECT nope, COUNT(*) FROM staff GROUP BY nope`:                 "no column nope",
+		`SELECT COUNT(*) FROM staff WHERE id > 99 GROUP BY nope`:         "no column nope", // reported even with no rows
+		`SELECT dept, SUM(name) FROM staff GROUP BY dept`:                "SUM needs an INT or FLOAT column",
+		`SELECT dept, COUNT(*) FROM staff GROUP BY dept ORDER BY salary`: "only be sorted by a GROUP BY column or an aggregate",
+		`SELECT dept FROM staff GROUP BY dept ORDER BY AVG(name)`:        "AVG needs an INT or FLOAT column",
+		`SELECT COUNT(*) FROM staff ORDER BY COUNT(*)`:                   "ORDER BY cannot be used with aggregate",
+		`SELECT name FROM staff ORDER BY COUNT(*)`:                       "needs GROUP BY",
+	}
+	for q, msg := range bad {
+		if _, err := e.Exec(q); err == nil || !strings.Contains(err.Error(), msg) {
+			t.Errorf("%s\n error %v, want %q", q, err, msg)
+		}
+	}
+}
+
+// TestGroupByMatchesManualCount checks GROUP BY against counting by hand on
+// a bigger table with many repeated values.
+func TestGroupByMatchesManualCount(t *testing.T) {
+	e := NewExecutor(store.New())
+	mustExec(t, e, `CREATE TABLE events (id INT PRIMARY KEY, kind INT, score FLOAT)`)
+	want := map[int64]int64{}
+	var b strings.Builder
+	b.WriteString(`INSERT INTO events VALUES `)
+	for i := 0; i < 500; i++ {
+		kind := int64(i*7%13 - 6) // repeats, includes negatives
+		want[kind]++
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "(%d, %d, %d.5)", i, kind, i%10)
+	}
+	mustExec(t, e, b.String())
+
+	got := rows(t, e, `SELECT kind, COUNT(*) FROM events GROUP BY kind`)
+	if len(got) != len(want) {
+		t.Fatalf("%d groups, want %d", len(got), len(want))
+	}
+	prev := int64(math.MinInt64)
+	for _, r := range got {
+		kind, n := r[0].(int64), r[1].(int64)
+		if n != want[kind] {
+			t.Errorf("kind %d: count %d, want %d", kind, n, want[kind])
+		}
+		if kind <= prev {
+			t.Errorf("groups not in order: %d after %d", kind, prev)
+		}
+		prev = kind
 	}
 }
 
