@@ -32,3 +32,18 @@ How it works:
 - An aggregate query without `GROUP BY` is just the one-group case of the same code, so it still always returns exactly one row.
 
 `GROUP` is now a reserved word, so a column can't be called `group` any more. Next up is `HAVING`, to filter groups after they're aggregated.
+
+## 2026-11-12: HAVING
+
+Added `HAVING` to `SELECT`, so grouped results can be filtered by their aggregates: `SELECT dept, COUNT(*) FROM students GROUP BY dept HAVING COUNT(*) >= 2`. It works without `GROUP BY` too, where the whole table is one group.
+
+Why: `GROUP BY` answered "how many per department?", but not "which departments have more than N?" or "which ones average above 3.5?". `WHERE` can't do it because it runs on single rows before anything is counted, so this needed its own clause.
+
+How it works:
+
+- New expression node `AggregateRef`, an aggregate used inside a condition. The parser only builds one while it's reading a `HAVING` (a flag on the parser), so `WHERE COUNT(*) > 1` or `UPDATE t SET a = SUM(b)` now fail with a message pointing to `HAVING` instead of a vague "expected a value".
+- The parser also checks that every plain column in `HAVING` is a `GROUP BY` column, the same rule as the select list, and rejects `HAVING` on a query with neither `GROUP BY` nor aggregates (that's just `WHERE`).
+- In the executor, `HAVING` runs right after grouping and before `ORDER BY`/`LIMIT`. For each group, `bindGroup` rewrites the condition into one with only literals in it: each aggregate becomes its value over the group's rows, each `GROUP BY` column becomes the group's value. That goes through the normal `eval`, so `HAVING` gets exactly the same NULL and comparison rules as `WHERE` with no second evaluator to keep in sync.
+- Aggregates in `HAVING` are type-checked up front with `checkAggregate`, so `HAVING SUM(name) > 1` is an error even when no rows match.
+
+`HAVING` is now a reserved word. Next on the SQL side is probably `DISTINCT` or simple `JOIN`s.

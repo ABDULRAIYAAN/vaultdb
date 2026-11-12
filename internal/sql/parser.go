@@ -18,9 +18,10 @@ import (
 //	SHOW TABLES
 //	INSERT INTO t [(col, ...)] VALUES (expr, ...), ...
 //	SELECT * | item, ... FROM t [WHERE expr] [GROUP BY col, ...]
-//	       [ORDER BY col|agg [ASC|DESC]] [LIMIT n]
+//	       [HAVING expr] [ORDER BY col|agg [ASC|DESC]] [LIMIT n]
 //	       item: col | agg
 //	       agg:  COUNT(*) COUNT(col) SUM(col) AVG(col) MIN(col) MAX(col)
+//	       (HAVING's expr may use aggs; other exprs may not)
 //	UPDATE t SET col = expr, ... [WHERE expr]
 //	DELETE FROM t [WHERE expr]
 //
@@ -45,6 +46,9 @@ func Parse(query string) (Statement, error) {
 type parser struct {
 	toks []Token
 	pos  int
+	// inHaving is set while reading a HAVING condition, the only place an
+	// aggregate may appear inside an expression.
+	inHaving bool
 }
 
 func (p *parser) peek() Token { return p.toks[p.pos] }
@@ -257,6 +261,14 @@ func (p *parser) selectStmt() (Statement, error) {
 			return nil, err
 		}
 	}
+	if p.acceptKeyword("HAVING") {
+		p.inHaving = true
+		st.Having, err = p.expr()
+		p.inHaving = false
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := checkGrouping(st); err != nil {
 		return nil, err
 	}
@@ -354,6 +366,12 @@ func (p *parser) aggregate() (Aggregate, error) {
 // a plain column in the select list of a grouped or aggregated query must be
 // one of the GROUP BY columns, because every row of a group shares its value.
 func checkGrouping(st Select) error {
+	if st.Having != nil && len(st.GroupBy) == 0 && !st.HasAggregates() {
+		return errors.New("HAVING needs GROUP BY or aggregate functions in the select list; use WHERE to filter rows")
+	}
+	if err := checkHavingColumns(st.Having, st.GroupBy); err != nil {
+		return err
+	}
 	if len(st.GroupBy) == 0 {
 		if st.HasAggregates() {
 			for _, it := range st.Items {
@@ -378,6 +396,31 @@ func checkGrouping(st Select) error {
 		if it.Agg == nil && !grouped[it.Column] {
 			return fmt.Errorf("column %s must be listed in GROUP BY or used inside an aggregate function", it.Column)
 		}
+	}
+	return nil
+}
+
+// checkHavingColumns makes sure every plain column in a HAVING condition is
+// a GROUP BY column. Anything else must sit inside an aggregate, for the same
+// reason as in the select list: a group has no single value for it.
+func checkHavingColumns(ex Expr, groupBy []string) error {
+	switch x := ex.(type) {
+	case ColumnRef:
+		for _, g := range groupBy {
+			if g == x.Name {
+				return nil
+			}
+		}
+		return fmt.Errorf("column %s in HAVING must be listed in GROUP BY or used inside an aggregate function", x.Name)
+	case Binary:
+		if err := checkHavingColumns(x.Left, groupBy); err != nil {
+			return err
+		}
+		return checkHavingColumns(x.Right, groupBy)
+	case Not:
+		return checkHavingColumns(x.Expr, groupBy)
+	case IsNull:
+		return checkHavingColumns(x.Expr, groupBy)
 	}
 	return nil
 }
@@ -518,6 +561,16 @@ func (p *parser) comparison() (Expr, error) {
 }
 
 func (p *parser) value() (Expr, error) {
+	if p.atAggregate() {
+		if !p.inHaving {
+			return nil, p.errorf("aggregate functions such as %s are not allowed here; use HAVING to filter groups", strings.ToUpper(p.peek().Text))
+		}
+		agg, err := p.aggregate()
+		if err != nil {
+			return nil, err
+		}
+		return AggregateRef{Agg: agg}, nil
+	}
 	t := p.peek()
 	switch {
 	case t.Kind == TokNumber:

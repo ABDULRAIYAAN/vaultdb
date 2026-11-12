@@ -8,7 +8,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) with `GROUP BY`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -237,7 +237,7 @@ vaultdb> SELECT name, gpa FROM students WHERE gpa > 3.5 ORDER BY gpa DESC
 (2 rows)
 ```
 
-Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, aggregates, `WHERE`, `GROUP BY`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL` and brackets.
+Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, aggregates, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL` and brackets.
 
 ### Aggregate functions
 
@@ -277,6 +277,27 @@ vaultdb> SELECT dept, COUNT(*), AVG(gpa), MAX(gpa) FROM students GROUP BY dept O
 - With no matching rows, a grouped query returns no rows, while a plain `SELECT COUNT(*)` still returns one row saying 0.
 
 How it runs: each matching row is put in a bucket (a Go map) keyed by the JSON text of its `GROUP BY` values, then every aggregate walks the rows of each bucket. One pass to group, one per aggregate per group.
+
+### HAVING
+
+```
+vaultdb> SELECT dept, COUNT(*), AVG(gpa) FROM students GROUP BY dept HAVING COUNT(*) >= 2 AND AVG(gpa) > 3.5
++------+-------+----------+
+| dept | count | avg(gpa) |
++------+-------+----------+
+| 'cs' | 2     | 3.75     |
++------+-------+----------+
+(1 row)
+```
+
+`HAVING` filters groups the way `WHERE` filters rows. The order is: `WHERE` picks rows, `GROUP BY` buckets them, `HAVING` drops whole groups, then `ORDER BY` and `LIMIT` run on what's left.
+
+- The condition can use any aggregate (selected or not) and the `GROUP BY` columns, with the same operators as `WHERE`. Any other column must sit inside an aggregate.
+- Aggregates are only allowed in `HAVING`. `WHERE COUNT(*) > 1` is an error that points you to `HAVING`, because `WHERE` runs on single rows before any counting happens.
+- Without `GROUP BY` the whole table is one group, so `SELECT COUNT(*) FROM t HAVING COUNT(*) > 5` returns its one row or nothing.
+- `NULL` works as in `WHERE`: a group is kept only when the condition is exactly true.
+
+How it runs: for each group, the executor swaps every aggregate in the condition for its value over that group, and every `GROUP BY` column for the group's value. What's left is an expression of plain values, which goes through the same evaluator as `WHERE`.
 
 ### How SQL runs
 

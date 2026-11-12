@@ -57,11 +57,16 @@ type Insert struct {
 // A plain column next to an aggregate must be listed in GROUP BY, otherwise
 // there is no single value to show for it (which row's name goes next to
 // SUM(gpa)?). The parser enforces that.
+//
+// HAVING filters groups the way WHERE filters rows, and can use aggregates:
+//
+//	SELECT dept, COUNT(*) FROM students GROUP BY dept HAVING COUNT(*) >= 2
 type Select struct {
 	Items    []SelectItem // empty means *
 	Table    string
 	Where    Expr       // nil means every row
 	GroupBy  []string   // empty means no grouping
+	Having   Expr       // nil means keep every group
 	OrderBy  string     // a column to sort by, or ""
 	OrderAgg *Aggregate // ORDER BY COUNT(*): sort groups by an aggregate instead
 	Desc     bool
@@ -162,8 +167,14 @@ type IsNull struct {
 	Negate bool
 }
 
-func (Literal) expr()   {}
-func (ColumnRef) expr() {}
-func (Binary) expr()    {}
-func (Not) expr()       {}
-func (IsNull) expr()    {}
+// AggregateRef is an aggregate used inside an expression, like COUNT(*) in
+// "HAVING COUNT(*) > 1". The parser only allows it in HAVING; the executor
+// replaces it with the group's value before evaluating.
+type AggregateRef struct{ Agg Aggregate }
+
+func (Literal) expr()      {}
+func (ColumnRef) expr()    {}
+func (Binary) expr()       {}
+func (Not) expr()          {}
+func (IsNull) expr()       {}
+func (AggregateRef) expr() {}

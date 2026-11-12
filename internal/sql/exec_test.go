@@ -193,6 +193,60 @@ func TestGroupBy(t *testing.T) {
 	}
 }
 
+func TestHaving(t *testing.T) {
+	e := setupGroups(t)
+	cases := []struct {
+		q    string
+		cols []string
+		want [][]any
+	}{
+		// Keep only groups with more than one row.
+		{`SELECT dept, COUNT(*) FROM staff GROUP BY dept HAVING COUNT(*) > 1`,
+			[]string{"dept", "count"}, [][]any{{"eng", int64(3)}, {"sales", int64(2)}}},
+		// The aggregate in HAVING does not have to be selected.
+		{`SELECT dept FROM staff GROUP BY dept HAVING AVG(salary) > 90`,
+			[]string{"dept"}, [][]any{{"eng"}}},
+		// GROUP BY columns can be used too, mixed with aggregates.
+		{`SELECT dept, year, COUNT(*) FROM staff GROUP BY dept, year HAVING year = 2024 AND COUNT(*) >= 1`,
+			[]string{"dept", "year", "count"},
+			[][]any{{"eng", int64(2024), int64(1)}, {"sales", int64(2024), int64(2)}}},
+		{`SELECT dept FROM staff GROUP BY dept HAVING dept IS NULL OR MIN(salary) < 90`,
+			[]string{"dept"}, [][]any{{nil}, {"sales"}}},
+		// A NULL condition drops the group, as in WHERE: for the NULL dept,
+		// dept = 'eng' is NULL, and NOT NULL is still NULL.
+		{`SELECT dept FROM staff GROUP BY dept HAVING NOT dept = 'eng'`,
+			[]string{"dept"}, [][]any{{"sales"}}},
+		// WHERE runs first, then HAVING, then ORDER BY and LIMIT.
+		{`SELECT dept, SUM(salary) FROM staff WHERE year = 2025 GROUP BY dept HAVING SUM(salary) > 0 ORDER BY SUM(salary) DESC LIMIT 1`,
+			[]string{"dept", "sum(salary)"}, [][]any{{"eng", int64(260)}}},
+		// Without GROUP BY the whole table is one group, so HAVING keeps
+		// that one row or returns none.
+		{`SELECT COUNT(*) FROM staff HAVING COUNT(*) > 5`, []string{"count"}, [][]any{{int64(6)}}},
+		{`SELECT COUNT(*) FROM staff HAVING COUNT(*) > 6`, []string{"count"}, nil},
+		// Every group filtered out.
+		{`SELECT dept FROM staff GROUP BY dept HAVING COUNT(*) > 100`, []string{"dept"}, nil},
+	}
+	for _, c := range cases {
+		r := mustExec(t, e, c.q)
+		if !reflect.DeepEqual(r.Columns, c.cols) || !reflect.DeepEqual(r.Rows, c.want) {
+			t.Errorf("%s\n got %v %v\nwant %v %v", c.q, r.Columns, r.Rows, c.cols, c.want)
+		}
+	}
+
+	bad := map[string]string{
+		`SELECT dept FROM staff GROUP BY dept HAVING SUM(name) > 1`:               "SUM needs an INT or FLOAT column",
+		`SELECT dept FROM staff WHERE id > 99 GROUP BY dept HAVING MAX(nope) > 1`: "no column nope", // reported even with no rows
+		`SELECT dept FROM staff GROUP BY dept HAVING COUNT(*) > 'many'`:           "cannot compare INT with TEXT",
+		`SELECT dept FROM staff GROUP BY dept HAVING salary > 1`:                  "must be listed in GROUP BY",
+		`SELECT * FROM staff WHERE COUNT(*) > 1`:                                  "use HAVING",
+	}
+	for q, msg := range bad {
+		if _, err := e.Exec(q); err == nil || !strings.Contains(err.Error(), msg) {
+			t.Errorf("%s\n error %v, want %q", q, err, msg)
+		}
+	}
+}
+
 // TestGroupByMatchesManualCount checks GROUP BY against counting by hand on
 // a bigger table with many repeated values.
 func TestGroupByMatchesManualCount(t *testing.T) {

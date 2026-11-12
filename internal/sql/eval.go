@@ -83,6 +83,11 @@ func eval(ex Expr, s *schema, row []any) (any, error) {
 			return c >= 0, nil
 		}
 		return nil, fmt.Errorf("unknown operator %s", x.Op)
+
+	case AggregateRef:
+		// groupRows swaps these for their values before calling eval, so
+		// reaching one here means an aggregate slipped in somewhere else.
+		return nil, fmt.Errorf("aggregate function %s can only be used in HAVING", x.Agg.Name())
 	}
 	return nil, fmt.Errorf("cannot evaluate %T", ex)
 }

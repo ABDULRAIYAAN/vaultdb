@@ -446,9 +446,10 @@ type group struct {
 //
 // With GROUP BY, rows are bucketed by their GROUP BY values: a map from an
 // encoding of those values to the group. NULLs count as equal here, so all
-// rows with a NULL dept form one group, again as in standard SQL. Groups come
-// back sorted by their GROUP BY values unless ORDER BY says otherwise, and
-// LIMIT counts groups, not the rows inside them.
+// rows with a NULL dept form one group, again as in standard SQL. HAVING then
+// drops the groups whose condition is not true. Groups come back sorted by
+// their GROUP BY values unless ORDER BY says otherwise, and LIMIT counts
+// groups, not the rows inside them.
 func groupRows(sel Select, s *schema, rows []storedRow) (Result, error) {
 	// Check every name up front, so a typo is reported even with no rows.
 	groupIdx := make([]int, len(sel.GroupBy))
@@ -462,6 +463,11 @@ func groupRows(sel Select, s *schema, rows []storedRow) (Result, error) {
 			if err := checkAggregate(*it.Agg, sel.Table, s); err != nil {
 				return Result{}, err
 			}
+		}
+	}
+	for _, a := range havingAggregates(sel.Having, nil) {
+		if err := checkAggregate(a, sel.Table, s); err != nil {
+			return Result{}, err
 		}
 	}
 	orderKey := -1 // which GROUP BY column ORDER BY names, if any
@@ -509,6 +515,24 @@ func groupRows(sel Select, s *schema, rows []storedRow) (Result, error) {
 			g.rows = append(g.rows, r)
 		}
 		sort.Slice(groups, func(a, b int) bool { return compareKeys(groups[a].keys, groups[b].keys) < 0 })
+	}
+
+	if sel.Having != nil {
+		kept := groups[:0]
+		for _, g := range groups {
+			cond, err := bindGroup(sel.Having, sel, s, g)
+			if err != nil {
+				return Result{}, err
+			}
+			v, err := eval(cond, nil, nil)
+			if err != nil {
+				return Result{}, fmt.Errorf("HAVING: %w", err)
+			}
+			if v == true {
+				kept = append(kept, g)
+			}
+		}
+		groups = kept
 	}
 
 	if sel.OrderAgg != nil || orderKey >= 0 {
@@ -571,6 +595,58 @@ func groupRows(sel Select, s *schema, rows []storedRow) (Result, error) {
 		res.Rows = append(res.Rows, out)
 	}
 	return res, nil
+}
+
+// havingAggregates lists every aggregate used in a HAVING condition.
+func havingAggregates(ex Expr, found []Aggregate) []Aggregate {
+	switch x := ex.(type) {
+	case AggregateRef:
+		return append(found, x.Agg)
+	case Binary:
+		return havingAggregates(x.Right, havingAggregates(x.Left, found))
+	case Not:
+		return havingAggregates(x.Expr, found)
+	case IsNull:
+		return havingAggregates(x.Expr, found)
+	}
+	return found
+}
+
+// bindGroup turns a HAVING condition into one with only literals in it, by
+// replacing each aggregate with its value over g's rows and each GROUP BY
+// column with g's value for it. The result can then go through the ordinary
+// eval, so HAVING gets exactly the same NULL and comparison rules as WHERE.
+func bindGroup(ex Expr, sel Select, s *schema, g *group) (Expr, error) {
+	switch x := ex.(type) {
+	case AggregateRef:
+		v, err := aggregate(x.Agg, s, g.rows)
+		return Literal{Value: v}, err
+	case ColumnRef:
+		// The parser made sure this column is in GROUP BY.
+		for k, name := range sel.GroupBy {
+			if name == x.Name {
+				return Literal{Value: g.keys[k]}, nil
+			}
+		}
+		return nil, fmt.Errorf("column %s in HAVING must be listed in GROUP BY", x.Name)
+	case Binary:
+		l, err := bindGroup(x.Left, sel, s, g)
+		if err != nil {
+			return nil, err
+		}
+		r, err := bindGroup(x.Right, sel, s, g)
+		if err != nil {
+			return nil, err
+		}
+		return Binary{Op: x.Op, Left: l, Right: r}, nil
+	case Not:
+		e, err := bindGroup(x.Expr, sel, s, g)
+		return Not{Expr: e}, err
+	case IsNull:
+		e, err := bindGroup(x.Expr, sel, s, g)
+		return IsNull{Expr: e, Negate: x.Negate}, err
+	}
+	return ex, nil
 }
 
 // compareKeys orders two lists of GROUP BY values column by column.

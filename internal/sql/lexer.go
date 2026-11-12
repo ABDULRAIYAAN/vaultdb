@@ -45,6 +45,7 @@ var keywords = map[string]bool{
 	"ORDER": true, "BY": true, "ASC": true, "DESC": true, "LIMIT": true,
 	"COUNT": true, "INT": true, "FLOAT": true, "TEXT": true, "BOOL": true,
 	"IS": true, "TABLES": true, "SHOW": true, "GROUP": true,
+	"HAVING": true,
 }
 
 // Lex cuts query into tokens. The last token is always TokEOF.
