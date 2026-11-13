@@ -238,6 +238,7 @@ func (p *parser) insertStmt() (Statement, error) {
 func (p *parser) selectStmt() (Statement, error) {
 	p.next() // SELECT
 	st := Select{Limit: -1}
+	st.Distinct = p.acceptKeyword("DISTINCT")
 	if !p.acceptSymbol("*") {
 		if err := p.selectList(&st); err != nil {
 			return nil, err
@@ -289,6 +290,9 @@ func (p *parser) selectStmt() (Statement, error) {
 			st.Desc = true
 		} else {
 			p.acceptKeyword("ASC")
+		}
+		if err := checkDistinctOrder(st); err != nil {
+			return nil, err
 		}
 	}
 	if p.acceptKeyword("LIMIT") {
@@ -348,7 +352,11 @@ func (p *parser) aggregate() (Aggregate, error) {
 	if err := p.expectSymbol("("); err != nil {
 		return agg, err
 	}
+	agg.Distinct = p.acceptKeyword("DISTINCT")
 	if p.acceptSymbol("*") {
+		if agg.Distinct {
+			return agg, p.errorf("%s(DISTINCT *) is not allowed; name a column, like COUNT(DISTINCT dept)", agg.Func)
+		}
 		if agg.Func != "COUNT" {
 			return agg, p.errorf("%s(*) is not allowed; only COUNT can take *", agg.Func)
 		}
@@ -398,6 +406,29 @@ func checkGrouping(st Select) error {
 		}
 	}
 	return nil
+}
+
+// checkDistinctOrder makes sure SELECT DISTINCT is only sorted by something
+// it shows. Duplicates are dropped after sorting, and two rows that look the
+// same can have different values in a hidden column, so there would be no
+// single value to sort the merged row by. Postgres has the same rule.
+func checkDistinctOrder(st Select) error {
+	if !st.Distinct || len(st.Items) == 0 { // SELECT DISTINCT * shows every column
+		return nil
+	}
+	for _, it := range st.Items {
+		if st.OrderAgg != nil && it.Agg != nil && *it.Agg == *st.OrderAgg {
+			return nil
+		}
+		if st.OrderAgg == nil && it.Agg == nil && it.Column == st.OrderBy {
+			return nil
+		}
+	}
+	name := st.OrderBy
+	if st.OrderAgg != nil {
+		name = st.OrderAgg.Name()
+	}
+	return fmt.Errorf("ORDER BY %s must be in the select list of a SELECT DISTINCT", name)
 }
 
 // checkHavingColumns makes sure every plain column in a HAVING condition is

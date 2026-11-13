@@ -61,7 +61,12 @@ type Insert struct {
 // HAVING filters groups the way WHERE filters rows, and can use aggregates:
 //
 //	SELECT dept, COUNT(*) FROM students GROUP BY dept HAVING COUNT(*) >= 2
+//
+// DISTINCT drops result rows that are exact copies of an earlier one:
+//
+//	SELECT DISTINCT dept FROM students
 type Select struct {
+	Distinct bool         // SELECT DISTINCT: keep only the first of identical result rows
 	Items    []SelectItem // empty means *
 	Table    string
 	Where    Expr       // nil means every row
@@ -100,16 +105,22 @@ func (s Select) HasAggregates() bool {
 
 // Aggregate is one function in a select list that boils many rows down to
 // one value: COUNT(*), COUNT(col), SUM(col), AVG(col), MIN(col) or MAX(col).
+// With Distinct, each different value is only used once, so
+// COUNT(DISTINCT dept) is the number of different departments.
 type Aggregate struct {
-	Func   string // COUNT, SUM, AVG, MIN or MAX
-	Column string // "" means * (only for COUNT)
+	Func     string // COUNT, SUM, AVG, MIN or MAX
+	Column   string // "" means * (only for COUNT)
+	Distinct bool   // COUNT(DISTINCT col): skip values already seen
 }
 
 // Name is the aggregate's column heading in a result: "count" for COUNT(*),
-// otherwise like "avg(gpa)".
+// otherwise like "avg(gpa)" or "count(distinct dept)".
 func (a Aggregate) Name() string {
 	if a.Column == "" {
 		return "count"
+	}
+	if a.Distinct {
+		return strings.ToLower(a.Func) + "(distinct " + a.Column + ")"
 	}
 	return strings.ToLower(a.Func) + "(" + a.Column + ")"
 }

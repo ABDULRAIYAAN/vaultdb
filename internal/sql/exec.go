@@ -401,8 +401,8 @@ func (e *Executor) selectRows(sel Select) (Result, error) {
 			return c < 0
 		})
 	}
-	if sel.Limit >= 0 && len(rows) > sel.Limit {
-		rows = rows[:sel.Limit]
+	if sel.Limit >= 0 && len(rows) > sel.Limit && !sel.Distinct {
+		rows = rows[:sel.Limit] // fewer rows to copy; with DISTINCT, LIMIT waits until duplicates are gone
 	}
 
 	pick := make([]int, 0, len(s.Columns))
@@ -429,7 +429,56 @@ func (e *Executor) selectRows(sel Select) (Result, error) {
 		}
 		res.Rows = append(res.Rows, out)
 	}
+	if sel.Distinct {
+		res.Rows = distinctRows(res.Rows)
+	}
+	res.Rows = limitRows(res.Rows, sel.Limit)
 	return res, nil
+}
+
+// distinctRows keeps the first of every set of identical rows and drops the
+// rest, without changing their order (so an ORDER BY still holds). NULLs
+// count as equal here, as in standard SQL's DISTINCT.
+func distinctRows(rows [][]any) [][]any {
+	seen := make(map[string]bool, len(rows))
+	kept := rows[:0]
+	for _, r := range rows {
+		k := valuesKey(r)
+		if !seen[k] {
+			seen[k] = true
+			kept = append(kept, r)
+		}
+	}
+	return kept
+}
+
+// limitRows cuts rows down to the first limit of them; -1 means no limit.
+func limitRows(rows [][]any, limit int) [][]any {
+	if limit >= 0 && len(rows) > limit {
+		return rows[:limit]
+	}
+	return rows
+}
+
+// valuesKey turns a list of values into a string that is equal for two lists
+// exactly when their values are equal, for use as a map key. It is the JSON
+// text of the values: a column has one type, so equal values give equal
+// text. The one exception is -0.0, which equals 0.0 but is written "-0", so
+// it is turned into 0.0 first.
+func valuesKey(vals []any) string {
+	norm := vals
+	copied := false // only copy vals if there is a -0.0 to fix, and never change the caller's slice
+	for i, v := range vals {
+		if f, ok := v.(float64); ok && f == 0 && math.Signbit(f) {
+			if !copied {
+				norm = append([]any(nil), vals...)
+				copied = true
+			}
+			norm[i] = 0.0
+		}
+	}
+	raw, _ := json.Marshal(norm)
+	return string(raw)
 }
 
 // group is the rows that share one combination of GROUP BY values.
@@ -503,13 +552,11 @@ func groupRows(sel Select, s *schema, rows []storedRow) (Result, error) {
 			for j, i := range groupIdx {
 				keys[j] = r.vals[i]
 			}
-			// Each column has one type, so the JSON text of the values is a
-			// safe map key: equal values give equal text and vice versa.
-			raw, _ := json.Marshal(keys)
-			g := byKey[string(raw)]
+			k := valuesKey(keys)
+			g := byKey[k]
 			if g == nil {
 				g = &group{keys: keys}
-				byKey[string(raw)] = g
+				byKey[k] = g
 				groups = append(groups, g)
 			}
 			g.rows = append(g.rows, r)
@@ -566,8 +613,8 @@ func groupRows(sel Select, s *schema, rows []storedRow) (Result, error) {
 		}
 		groups = sorted
 	}
-	if sel.Limit >= 0 && len(groups) > sel.Limit {
-		groups = groups[:sel.Limit]
+	if sel.Limit >= 0 && len(groups) > sel.Limit && !sel.Distinct {
+		groups = groups[:sel.Limit] // skip aggregating groups LIMIT would drop anyway
 	}
 
 	res := Result{Columns: make([]string, len(sel.Items))}
@@ -594,6 +641,10 @@ func groupRows(sel Select, s *schema, rows []storedRow) (Result, error) {
 		}
 		res.Rows = append(res.Rows, out)
 	}
+	if sel.Distinct {
+		res.Rows = distinctRows(res.Rows)
+	}
+	res.Rows = limitRows(res.Rows, sel.Limit)
 	return res, nil
 }
 
@@ -690,11 +741,23 @@ func aggregate(a Aggregate, s *schema, rows []storedRow) (any, error) {
 		sumInt int64   // exact running total for INT columns
 		sumF   float64 // running total for FLOAT columns and for AVG
 		best   any     // current MIN or MAX
+		seen   map[any]bool
 	)
+	if a.Distinct {
+		seen = map[any]bool{}
+	}
 	for _, r := range rows {
 		v := r.vals[i]
 		if v == nil {
 			continue
+		}
+		if a.Distinct {
+			// Values are int64, float64, string or bool, which all work as
+			// map keys. Go's map also treats 0.0 and -0.0 as the same key.
+			if seen[v] {
+				continue
+			}
+			seen[v] = true
 		}
 		count++
 		switch a.Func {

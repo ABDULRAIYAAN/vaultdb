@@ -8,7 +8,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -237,7 +237,7 @@ vaultdb> SELECT name, gpa FROM students WHERE gpa > 3.5 ORDER BY gpa DESC
 (2 rows)
 ```
 
-Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, aggregates, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL` and brackets.
+Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, `DISTINCT`, aggregates, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL` and brackets.
 
 ### Aggregate functions
 
@@ -298,6 +298,36 @@ vaultdb> SELECT dept, COUNT(*), AVG(gpa) FROM students GROUP BY dept HAVING COUN
 - `NULL` works as in `WHERE`: a group is kept only when the condition is exactly true.
 
 How it runs: for each group, the executor swaps every aggregate in the condition for its value over that group, and every `GROUP BY` column for the group's value. What's left is an expression of plain values, which goes through the same evaluator as `WHERE`.
+
+### DISTINCT
+
+```
+vaultdb> SELECT DISTINCT dept FROM students ORDER BY dept
++-----------+
+| dept      |
++-----------+
+| 'cs'      |
+| 'math'    |
+| 'physics' |
++-----------+
+(3 rows)
+vaultdb> SELECT COUNT(*), COUNT(DISTINCT dept) FROM students
++-------+----------------------+
+| count | count(distinct dept) |
++-------+----------------------+
+| 5     | 3                    |
++-------+----------------------+
+(1 row)
+```
+
+`SELECT DISTINCT` drops result rows that are exact copies of an earlier one. Inside an aggregate, `DISTINCT` makes it use each different value once: `COUNT(DISTINCT dept)` is the number of departments, `SUM(DISTINCT n)` adds each different `n` once.
+
+- `NULL`s count as equal for `SELECT DISTINCT` (one `NULL` row is kept), and are skipped by aggregates as usual, so `COUNT(DISTINCT col)` never counts `NULL`.
+- `LIMIT` counts rows after duplicates are removed, so `SELECT DISTINCT dept FROM students LIMIT 2` gives two different departments.
+- `ORDER BY` on a `SELECT DISTINCT` must name something in the select list (Postgres has the same rule): two rows that look the same could hold different values in a hidden column, so there's nothing to sort the merged row by.
+- It works on grouped results too: `SELECT DISTINCT COUNT(*) FROM students GROUP BY dept` lists each group size once. `COUNT(*)` can't take `DISTINCT`; name a column instead.
+
+How it runs: each result row is turned into a map key (the JSON text of its values) and only rows whose key hasn't been seen are kept, so the order from `ORDER BY` is preserved. Aggregates keep a small set of the values they've already used and skip repeats.
 
 ### How SQL runs
 

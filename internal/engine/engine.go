@@ -46,6 +46,7 @@ SQL (tables are stored as keys under sql:):
   SELECT COUNT(*), AVG(gpa), MAX(gpa) FROM students WHERE active = TRUE
   SELECT active, COUNT(*), AVG(gpa) FROM students GROUP BY active ORDER BY COUNT(*) DESC
   SELECT active, COUNT(*) FROM students GROUP BY active HAVING AVG(gpa) > 3.5
+  SELECT DISTINCT active FROM students  |  SELECT COUNT(DISTINCT gpa) FROM students
   UPDATE students SET gpa = 4.0 WHERE id = 1
   DELETE FROM students WHERE id = 2
   SHOW TABLES  |  DROP TABLE students`

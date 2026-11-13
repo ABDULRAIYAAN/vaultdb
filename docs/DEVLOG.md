@@ -47,3 +47,20 @@ How it works:
 - Aggregates in `HAVING` are type-checked up front with `checkAggregate`, so `HAVING SUM(name) > 1` is an error even when no rows match.
 
 `HAVING` is now a reserved word. Next on the SQL side is probably `DISTINCT` or simple `JOIN`s.
+
+## 2026-11-13: DISTINCT
+
+Added `SELECT DISTINCT` and `DISTINCT` inside aggregates: `SELECT DISTINCT dept FROM students` lists each department once, and `SELECT COUNT(DISTINCT dept) FROM students` says how many there are.
+
+Why: "which values are there?" and "how many different ones?" are two of the most common questions after `COUNT(*)`. `GROUP BY` could already fake the first one, but not the second, and `COUNT(DISTINCT user)` (unique visitors, unique customers) is something you can't get any other way without pulling every row out.
+
+How it works:
+
+- `Select` got a `Distinct` flag and `Aggregate` got one too, so `COUNT(DISTINCT dept)` is its own aggregate with its own heading (`count(distinct dept)`). `DISTINCT` is now a reserved word. `COUNT(DISTINCT *)` is rejected with a hint to name a column.
+- The executor builds the result rows as before, then `distinctRows` keeps the first copy of each one using a map keyed by the JSON text of the row, so `ORDER BY` order survives. `LIMIT` now runs after that step, otherwise `SELECT DISTINCT dept ... LIMIT 2` could return the same department twice and then stop. It works the same way on grouped results.
+- For aggregates, `aggregate()` keeps a set of values it has already used and skips repeats. Values are always `int64`, `float64`, `string` or `bool`, so they work directly as Go map keys.
+- The parser refuses `ORDER BY` on a column that a `SELECT DISTINCT` doesn't show, like Postgres does. Once duplicates are merged there's no single hidden value left to sort by.
+
+While testing I found that `0.0` and `-0.0` landed in different `GROUP BY` groups because their JSON text differs (`0` vs `-0`). Grouping and `DISTINCT` now share one `valuesKey` helper that turns `-0.0` into `0.0` first, with a test for both.
+
+Next on the SQL side: simple `JOIN`s, or `IN (...)` and `LIKE` in conditions.

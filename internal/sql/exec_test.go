@@ -247,6 +247,118 @@ func TestHaving(t *testing.T) {
 	}
 }
 
+func TestDistinct(t *testing.T) {
+	e := setupGroups(t)
+	mustExec(t, e, `CREATE TABLE tags (tag TEXT, n INT)`) // no primary key, so rows can repeat
+	mustExec(t, e, `INSERT INTO tags VALUES ('a', 1), ('a', 1), ('b', NULL), ('b', NULL), ('a', 2)`)
+	cases := []struct {
+		q    string
+		cols []string
+		want [][]any
+	}{
+		// The first copy of each row is kept, in the order rows were read.
+		{`SELECT DISTINCT dept FROM staff`, []string{"dept"}, [][]any{{"eng"}, {"sales"}, {nil}}},
+		{`SELECT DISTINCT dept FROM staff ORDER BY dept`, []string{"dept"}, [][]any{{nil}, {"eng"}, {"sales"}}},
+		{`SELECT DISTINCT dept, year FROM staff`, []string{"dept", "year"},
+			[][]any{{"eng", int64(2024)}, {"eng", int64(2025)}, {"sales", int64(2024)}, {nil, int64(2025)}}},
+		// LIMIT counts rows after duplicates are gone: two different depts,
+		// not the first two rows (which are both eng).
+		{`SELECT DISTINCT dept FROM staff LIMIT 2`, []string{"dept"}, [][]any{{"eng"}, {"sales"}}},
+		{`SELECT DISTINCT year FROM staff WHERE salary > 60 ORDER BY year DESC`, []string{"year"},
+			[][]any{{int64(2025)}, {int64(2024)}}},
+		// DISTINCT * compares whole rows; NULLs count as equal.
+		{`SELECT DISTINCT * FROM tags`, []string{"tag", "n"}, [][]any{{"a", int64(1)}, {"b", nil}, {"a", int64(2)}}},
+		{`SELECT DISTINCT tag FROM tags WHERE n IS NULL`, []string{"tag"}, [][]any{{"b"}}},
+
+		// Aggregates over distinct values only. NULLs are still skipped.
+		{`SELECT COUNT(DISTINCT dept), COUNT(dept), COUNT(DISTINCT year) FROM staff`,
+			[]string{"count(distinct dept)", "count(dept)", "count(distinct year)"},
+			[][]any{{int64(2), int64(5), int64(2)}}},
+		{`SELECT SUM(DISTINCT n), SUM(n), AVG(DISTINCT n), MAX(DISTINCT n) FROM tags`,
+			[]string{"sum(distinct n)", "sum(n)", "avg(distinct n)", "max(distinct n)"},
+			[][]any{{int64(3), int64(4), 1.5, int64(2)}}},
+		{`SELECT COUNT(DISTINCT n) FROM tags WHERE n IS NULL`, []string{"count(distinct n)"}, [][]any{{int64(0)}}},
+		// Per group, and in HAVING.
+		{`SELECT dept, COUNT(DISTINCT year) FROM staff GROUP BY dept`,
+			[]string{"dept", "count(distinct year)"},
+			[][]any{{nil, int64(1)}, {"eng", int64(2)}, {"sales", int64(1)}}},
+		{`SELECT dept FROM staff GROUP BY dept HAVING COUNT(DISTINCT year) > 1`, []string{"dept"}, [][]any{{"eng"}}},
+
+		// DISTINCT on a grouped result: both years have 3 people.
+		{`SELECT DISTINCT COUNT(*) FROM staff GROUP BY year`, []string{"count"}, [][]any{{int64(3)}}},
+		{`SELECT DISTINCT COUNT(DISTINCT year) FROM staff GROUP BY dept ORDER BY COUNT(DISTINCT year) DESC`,
+			[]string{"count(distinct year)"}, [][]any{{int64(2)}, {int64(1)}}},
+		{`SELECT DISTINCT COUNT(*) FROM staff GROUP BY dept LIMIT 2`, []string{"count"}, [][]any{{int64(1)}, {int64(3)}}},
+	}
+	for _, c := range cases {
+		r := mustExec(t, e, c.q)
+		if !reflect.DeepEqual(r.Columns, c.cols) || !reflect.DeepEqual(r.Rows, c.want) {
+			t.Errorf("%s\n got %v %v\nwant %v %v", c.q, r.Columns, r.Rows, c.cols, c.want)
+		}
+	}
+
+	bad := map[string]string{
+		`SELECT DISTINCT nope FROM staff`:                      "no column nope",
+		`SELECT COUNT(DISTINCT nope) FROM staff WHERE id > 99`: "no column nope", // reported even with no rows
+		`SELECT SUM(DISTINCT name) FROM staff`:                 "SUM needs an INT or FLOAT column",
+		`SELECT DISTINCT dept FROM staff ORDER BY salary`:      "must be in the select list",
+	}
+	for q, msg := range bad {
+		if _, err := e.Exec(q); err == nil || !strings.Contains(err.Error(), msg) {
+			t.Errorf("%s\n error %v, want %q", q, err, msg)
+		}
+	}
+}
+
+// TestDistinctNegativeZero checks that 0.0 and -0.0, which are equal, are
+// not kept apart by DISTINCT, COUNT(DISTINCT) or GROUP BY.
+func TestDistinctNegativeZero(t *testing.T) {
+	e := NewExecutor(store.New())
+	mustExec(t, e, `CREATE TABLE f (x FLOAT)`)
+	mustExec(t, e, `INSERT INTO f VALUES (0.0), (-0.0), (1.5)`)
+	for q, want := range map[string]int{
+		`SELECT DISTINCT x FROM f`:             2,
+		`SELECT x, COUNT(*) FROM f GROUP BY x`: 2,
+	} {
+		if got := rows(t, e, q); len(got) != want {
+			t.Errorf("%s: %d rows %v, want %d", q, len(got), got, want)
+		}
+	}
+	if got := rows(t, e, `SELECT COUNT(DISTINCT x) FROM f`); got[0][0] != int64(2) {
+		t.Errorf("COUNT(DISTINCT x) = %v, want 2", got[0][0])
+	}
+}
+
+// TestDistinctMatchesManualCount checks DISTINCT and COUNT(DISTINCT) against
+// a Go map on a bigger table with many repeated values.
+func TestDistinctMatchesManualCount(t *testing.T) {
+	e := NewExecutor(store.New())
+	mustExec(t, e, `CREATE TABLE events (id INT PRIMARY KEY, kind INT, user TEXT)`)
+	kinds, pairs := map[int64]bool{}, map[string]bool{}
+	var b strings.Builder
+	b.WriteString(`INSERT INTO events VALUES `)
+	for i := 0; i < 400; i++ {
+		kind, user := int64(i*5%11-3), fmt.Sprintf("u%d", i%7)
+		kinds[kind] = true
+		pairs[fmt.Sprint(kind, user)] = true
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "(%d, %d, '%s')", i, kind, user)
+	}
+	mustExec(t, e, b.String())
+
+	if got := rows(t, e, `SELECT DISTINCT kind FROM events`); len(got) != len(kinds) {
+		t.Errorf("DISTINCT kind: %d rows, want %d", len(got), len(kinds))
+	}
+	if got := rows(t, e, `SELECT DISTINCT kind, user FROM events`); len(got) != len(pairs) {
+		t.Errorf("DISTINCT kind, user: %d rows, want %d", len(got), len(pairs))
+	}
+	if got := rows(t, e, `SELECT COUNT(DISTINCT kind) FROM events`); got[0][0] != int64(len(kinds)) {
+		t.Errorf("COUNT(DISTINCT kind) = %v, want %d", got[0][0], len(kinds))
+	}
+}
+
 // TestGroupByMatchesManualCount checks GROUP BY against counting by hand on
 // a bigger table with many repeated values.
 func TestGroupByMatchesManualCount(t *testing.T) {
