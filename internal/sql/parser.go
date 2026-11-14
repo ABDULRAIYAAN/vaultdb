@@ -452,6 +452,17 @@ func checkHavingColumns(ex Expr, groupBy []string) error {
 		return checkHavingColumns(x.Expr, groupBy)
 	case IsNull:
 		return checkHavingColumns(x.Expr, groupBy)
+	case In:
+		for _, e := range append([]Expr{x.Expr}, x.List...) {
+			if err := checkHavingColumns(e, groupBy); err != nil {
+				return err
+			}
+		}
+	case Like:
+		if err := checkHavingColumns(x.Expr, groupBy); err != nil {
+			return err
+		}
+		return checkHavingColumns(x.Pattern, groupBy)
 	}
 	return nil
 }
@@ -523,7 +534,8 @@ func (p *parser) identList(what string) ([]string, error) {
 
 // Expressions, from loosest to tightest binding:
 //
-//	OR  <  AND  <  NOT  <  comparison (= != <> < <= > >=, IS [NOT] NULL)  <  value
+//	OR  <  AND  <  NOT  <  comparison (= != <> < <= > >=, IS [NOT] NULL,
+//	                                  [NOT] IN (...), [NOT] LIKE)  <  value
 //
 // So "a = 1 OR b = 2 AND c = 3" means "a = 1 OR (b = 2 AND c = 3)", exactly
 // like in real SQL. Each level calls the next tighter one for its operands.
@@ -572,6 +584,25 @@ func (p *parser) comparison() (Expr, error) {
 		}
 		return IsNull{Expr: left, Negate: negate}, nil
 	}
+	// "a NOT IN (...)" and "a NOT LIKE p": a NOT straight after a value can
+	// only belong to one of these.
+	negate := p.acceptKeyword("NOT")
+	switch {
+	case p.acceptKeyword("IN"):
+		list, err := p.inList()
+		if err != nil {
+			return nil, err
+		}
+		return In{Expr: left, List: list, Negate: negate}, nil
+	case p.acceptKeyword("LIKE"):
+		pattern, err := p.value()
+		if err != nil {
+			return nil, err
+		}
+		return Like{Expr: left, Pattern: pattern, Negate: negate}, nil
+	case negate:
+		return nil, p.errorf("expected IN or LIKE after NOT, found %s", describe(p.peek()))
+	}
 	t := p.peek()
 	if t.Kind == TokSymbol {
 		switch t.Text {
@@ -589,6 +620,28 @@ func (p *parser) comparison() (Expr, error) {
 		}
 	}
 	return left, nil
+}
+
+// inList reads the "(a, b, c)" after IN. An empty list is an error, as in
+// standard SQL: "x IN ()" is almost always a bug in whatever built the query.
+func (p *parser) inList() ([]Expr, error) {
+	if err := p.expectSymbol("("); err != nil {
+		return nil, err
+	}
+	if p.peek().Kind == TokSymbol && p.peek().Text == ")" {
+		return nil, p.errorf("IN needs at least one value")
+	}
+	var list []Expr
+	for {
+		v, err := p.value()
+		if err != nil {
+			return nil, err
+		}
+		list = append(list, v)
+		if !p.acceptSymbol(",") {
+			return list, p.expectSymbol(")")
+		}
+	}
 }
 
 func (p *parser) value() (Expr, error) {

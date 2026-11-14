@@ -8,7 +8,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE`, `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN` and `LIKE`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -237,7 +237,35 @@ vaultdb> SELECT name, gpa FROM students WHERE gpa > 3.5 ORDER BY gpa DESC
 (2 rows)
 ```
 
-Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, `DISTINCT`, aggregates, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL` and brackets.
+Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, `DISTINCT`, aggregates, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] IN (...)`, `[NOT] LIKE` and brackets.
+
+### IN and LIKE
+
+```
+vaultdb> SELECT id, name FROM students WHERE id IN (3, 1)
++----+-----------+
+| id | name      |
++----+-----------+
+| 1  | 'Raiyaan' |
+| 3  | 'Sara'    |
++----+-----------+
+(2 rows)
+vaultdb> SELECT name FROM students WHERE name LIKE '%a_'
++-----------+
+| name      |
++-----------+
+| 'Raiyaan' |
++-----------+
+(1 row)
+```
+
+`x IN (a, b, c)` is a shorter `x = a OR x = b OR x = c`. `LIKE` matches text against a pattern: `%` is any run of characters (even none), `_` is exactly one character, and a backslash makes the next character literal (`'50\%'` matches the text `50%`). Both have a `NOT` form and work in `WHERE`, `HAVING`, `UPDATE` and `DELETE`.
+
+- `LIKE` is case-sensitive, as in Postgres, and `_` counts characters, not bytes, so `'h_llo'` matches `'héllo'`. Both sides must be `TEXT`.
+- `NULL` follows standard SQL. `x IN (1, NULL)` is true when `x` is 1 and otherwise unknown, so `x NOT IN (1, NULL)` never keeps a row. That's a famous SQL trap; use `IS NOT NULL` or leave `NULL` out of the list.
+- `WHERE id IN (3, 1, 7)` on the primary key doesn't read the table: it does one key lookup per value, like `WHERE id = 3` does.
+
+How `LIKE` runs: two pointers walk the text and the pattern. On a `%` the matcher remembers where it was; on a mismatch it jumps back there and lets the `%` swallow one more character. Only the last `%` ever needs revisiting, so a nasty pattern like `'%a%a%a%a%b'` can't make it take exponential time. A fuzz test checks it against Go's `regexp` package on random inputs.
 
 ### Aggregate functions
 
@@ -349,7 +377,7 @@ sql:row:students:8000000000000001     [1,"Raiyaan",3.9]
 sql:row:students:8000000000000002     [2,"Ali",3.2]
 ```
 
-Because the store is a B-tree, a table's rows sit next to each other, so a full table read is one prefix walk. `WHERE id = 2` on the primary key skips the walk and does a single key lookup. Integer keys are written as 16 hex digits with the sign bit flipped, so key order matches number order, negatives included.
+Because the store is a B-tree, a table's rows sit next to each other, so a full table read is one prefix walk. `WHERE id = 2` on the primary key skips the walk and does a single key lookup, and `WHERE id IN (2, 5)` does one per value. Integer keys are written as 16 hex digits with the sign bit flipped, so key order matches number order, negatives included.
 
 Rules the executor enforces: types must match the column (an `INT` is accepted in a `FLOAT` column), primary keys must be unique and not `NULL`, a multi-row `INSERT` is checked completely before any row is written, and comparing with `NULL` is never true (use `IS NULL`), as in standard SQL.
 

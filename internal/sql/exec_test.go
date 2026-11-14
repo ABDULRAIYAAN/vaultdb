@@ -541,3 +541,85 @@ func TestFormatTable(t *testing.T) {
 		t.Fatalf("empty result:\n%s", got)
 	}
 }
+
+func TestInAndLike(t *testing.T) {
+	e := setup(t) // ids -5, 1, 2, 3: Old (gpa NULL), Ali, Sara, Raiyaan
+	cases := []struct {
+		q    string
+		want [][]any
+	}{
+		{`SELECT name FROM students WHERE id IN (3, 1, 99)`, [][]any{{"Ali"}, {"Raiyaan"}}}, // pk lookups, still in key order
+		{`SELECT name FROM students WHERE id IN (2, 2, 2)`, [][]any{{"Sara"}}},
+		{`SELECT name FROM students WHERE id IN (1.0, 2.5)`, [][]any{{"Ali"}}}, // FLOAT vs INT pk falls back to a scan
+		{`SELECT name FROM students WHERE id NOT IN (1, 2)`, [][]any{{"Old"}, {"Raiyaan"}}},
+		{`SELECT name FROM students WHERE name IN ('Ali', 'Sara') ORDER BY name DESC`, [][]any{{"Sara"}, {"Ali"}}},
+		{`SELECT name FROM students WHERE gpa IN (3.9, 3.2)`, [][]any{{"Ali"}, {"Raiyaan"}}},
+		{`SELECT name FROM students WHERE gpa NOT IN (3.9)`, [][]any{{"Ali"}, {"Sara"}}}, // NULL gpa: unknown, skipped
+		{`SELECT name FROM students WHERE id IN (1, NULL)`, [][]any{{"Ali"}}},
+		{`SELECT name FROM students WHERE id NOT IN (1, NULL)`, nil}, // the classic NOT IN + NULL trap
+		{`SELECT name FROM students WHERE id IN (NULL)`, nil},
+		{`SELECT name FROM students WHERE (id IN (1, 2)) IS NULL`, nil},
+		{`SELECT name FROM students WHERE (gpa IN (1.0)) IS NULL`, [][]any{{"Old"}}},
+		{`SELECT name FROM students WHERE id IN (1, 2) AND active = TRUE`, [][]any{{"Ali"}}},
+		{`SELECT name FROM students WHERE name IN (name)`, [][]any{{"Old"}, {"Ali"}, {"Sara"}, {"Raiyaan"}}},
+
+		{`SELECT name FROM students WHERE name LIKE 'Ra%'`, [][]any{{"Raiyaan"}}},
+		{`SELECT name FROM students WHERE name LIKE '%a%'`, [][]any{{"Sara"}, {"Raiyaan"}}}, // case-sensitive: not Ali
+		{`SELECT name FROM students WHERE name LIKE '_l_'`, [][]any{{"Old"}, {"Ali"}}},
+		{`SELECT name FROM students WHERE name LIKE 'Sara'`, [][]any{{"Sara"}}},
+		{`SELECT name FROM students WHERE name LIKE 'Sar'`, nil},
+		{`SELECT name FROM students WHERE name NOT LIKE '%a%'`, [][]any{{"Old"}, {"Ali"}}},
+		{`SELECT name FROM students WHERE NOT name LIKE '%a%'`, [][]any{{"Old"}, {"Ali"}}},
+		{`SELECT name FROM students WHERE name LIKE name`, [][]any{{"Old"}, {"Ali"}, {"Sara"}, {"Raiyaan"}}},
+		{`SELECT name FROM students WHERE name LIKE NULL`, nil},
+		{`SELECT COUNT(*) FROM students WHERE name LIKE '%'`, [][]any{{int64(4)}}},
+	}
+	for _, c := range cases {
+		if got := rows(t, e, c.q); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s\n got %v\nwant %v", c.q, got, c.want)
+		}
+	}
+
+	// UPDATE and DELETE use the same WHERE, including the pk IN shortcut.
+	mustExec(t, e, `UPDATE students SET active = FALSE WHERE id IN (1, 3)`)
+	if got := rows(t, e, `SELECT COUNT(*) FROM students WHERE active = TRUE`); got[0][0] != int64(0) {
+		t.Errorf("after UPDATE ... IN, active count = %v, want 0", got[0][0])
+	}
+	if r := mustExec(t, e, `DELETE FROM students WHERE name LIKE '%a%'`); r.Message != "OK, 2 rows deleted" {
+		t.Errorf("DELETE ... LIKE said %q", r.Message)
+	}
+
+	for q, wantMsg := range map[string]string{
+		`SELECT * FROM students WHERE id LIKE '1%'`:      "LIKE needs TEXT on both sides, got INT LIKE TEXT",
+		`SELECT * FROM students WHERE name LIKE 5`:       "LIKE needs TEXT on both sides",
+		`SELECT * FROM students WHERE name LIKE 'ab\'`:   "ends with a lone backslash",
+		`SELECT * FROM students WHERE name IN (1, 2)`:    "cannot compare TEXT with INT",
+		`SELECT * FROM students WHERE id IN ('a')`:       "cannot compare INT with TEXT",
+		`SELECT * FROM students WHERE nope IN (1)`:       "unknown column nope",
+		`SELECT * FROM students WHERE id IN (1, nope)`:   "unknown column nope",
+		`SELECT * FROM students WHERE name LIKE nope`:    "unknown column nope",
+		`DELETE FROM students WHERE nope NOT LIKE 'x'`:   "unknown column nope",
+		`UPDATE students SET gpa = 1 WHERE id IN (nope)`: "unknown column nope",
+	} {
+		if _, err := e.Exec(q); err == nil || !strings.Contains(err.Error(), wantMsg) {
+			t.Errorf("%s\n error = %v, want it to mention %q", q, err, wantMsg)
+		}
+	}
+}
+
+func TestInAndLikeInHaving(t *testing.T) {
+	e := setupGroups(t)
+	cases := []struct {
+		q    string
+		want [][]any
+	}{
+		{`SELECT dept, COUNT(*) FROM staff GROUP BY dept HAVING COUNT(*) IN (1, 3)`, [][]any{{nil, int64(1)}, {"eng", int64(3)}}},
+		{`SELECT dept FROM staff GROUP BY dept HAVING dept LIKE 's%'`, [][]any{{"sales"}}},
+		{`SELECT dept FROM staff GROUP BY dept HAVING dept NOT IN ('eng') AND MAX(salary) IN (80, SUM(salary))`, [][]any{{"sales"}}},
+	}
+	for _, c := range cases {
+		if got := rows(t, e, c.q); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s\n got %v\nwant %v", c.q, got, c.want)
+		}
+	}
+}

@@ -144,6 +144,10 @@ func TestPrecedence(t *testing.T) {
 		`a = 1 OR b = 2 AND c = 3`:   bin("OR", a, bin("AND", b, c)),
 		`(a = 1 OR b = 2) AND c = 3`: bin("AND", bin("OR", a, b), c),
 		`NOT a = 1 AND b = 2`:        bin("AND", Not{Expr: a}, b),
+		`a IN (1, 'x', NULL)`:        In{Expr: col("a"), List: []Expr{lit(int64(1)), lit("x"), lit(nil)}},
+		`a NOT IN (b) OR c = 3`:      bin("OR", In{Expr: col("a"), List: []Expr{col("b")}, Negate: true}, c),
+		`NOT a LIKE 'x%' AND b = 2`:  bin("AND", Not{Expr: Like{Expr: col("a"), Pattern: lit("x%")}}, b),
+		`a NOT LIKE b`:               Like{Expr: col("a"), Pattern: col("b"), Negate: true},
 		`a = 1 AND b = 2 AND c = 3`:  bin("AND", bin("AND", a, b), c), // left to right
 	}
 	for where, want := range cases {
@@ -193,6 +197,13 @@ func TestParseErrors(t *testing.T) {
 		`SELECT DISTINCT name FROM t ORDER BY gpa`:                                       "ORDER BY gpa must be in the select list of a SELECT DISTINCT",
 		`SELECT DISTINCT dept FROM t GROUP BY dept ORDER BY COUNT(*)`:                    "ORDER BY count must be in the select list",
 		`SELECT DISTINCT COUNT(year) FROM t GROUP BY dept ORDER BY COUNT(DISTINCT year)`: "ORDER BY count(distinct year) must be in the select list",
+		`SELECT * FROM t WHERE a IN ()`:                                                  "IN needs at least one value",
+		`SELECT * FROM t WHERE a IN 1, 2`:                                                `expected "("`,
+		`SELECT * FROM t WHERE a IN (1, 2`:                                               `expected ")"`,
+		`SELECT * FROM t WHERE a NOT = 1`:                                                "expected IN or LIKE after NOT",
+		`SELECT * FROM t WHERE a LIKE`:                                                   "expected a value",
+		`SELECT dept FROM t GROUP BY dept HAVING name LIKE 'A%'`:                         "name in HAVING must be listed in GROUP BY",
+		`SELECT dept FROM t GROUP BY dept HAVING dept IN (name)`:                         "name in HAVING must be listed in GROUP BY",
 	}
 	for q, wantMsg := range cases {
 		_, err := Parse(q)

@@ -178,6 +178,26 @@ type IsNull struct {
 	Negate bool
 }
 
+// In is "Expr IN (a, b, c)" or, with Negate, "Expr NOT IN (...)". It is true
+// when Expr equals one of the list values. Like "=", it follows the NULL
+// rules of standard SQL: a NULL on the left, or no match in a list that holds
+// a NULL, gives NULL rather than FALSE.
+type In struct {
+	Expr   Expr
+	List   []Expr // never empty
+	Negate bool
+}
+
+// Like is "Expr LIKE pattern" or, with Negate, "Expr NOT LIKE pattern". In the
+// pattern % stands for any run of characters (even none), _ for exactly one
+// character, and a backslash makes the next character mean itself, so '50\%'
+// only matches the text 50%. Matching is case-sensitive.
+type Like struct {
+	Expr    Expr
+	Pattern Expr
+	Negate  bool
+}
+
 // AggregateRef is an aggregate used inside an expression, like COUNT(*) in
 // "HAVING COUNT(*) > 1". The parser only allows it in HAVING; the executor
 // replaces it with the group's value before evaluating.
@@ -188,4 +208,6 @@ func (ColumnRef) expr()    {}
 func (Binary) expr()       {}
 func (Not) expr()          {}
 func (IsNull) expr()       {}
+func (In) expr()           {}
+func (Like) expr()         {}
 func (AggregateRef) expr() {}

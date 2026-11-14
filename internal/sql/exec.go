@@ -313,13 +313,15 @@ type storedRow struct {
 }
 
 // matchingRows returns every row of the table that passes where. If where is
-// "primary key = value", it fetches that one row directly with a GET instead
-// of reading the whole table.
+// "primary key = value" or "primary key IN (values)", it fetches just those
+// rows directly with a GET each instead of reading the whole table.
 func (e *Executor) matchingRows(table string, s *schema, where Expr) ([]storedRow, error) {
 	var candidates []store.KV
-	if key, ok := pkLookup(table, s, where); ok {
-		if raw, err := e.st.Get(key); err == nil {
-			candidates = []store.KV{{Key: key, Value: raw}}
+	if keys, ok := pkLookup(table, s, where); ok {
+		for _, key := range keys {
+			if raw, err := e.st.Get(key); err == nil {
+				candidates = append(candidates, store.KV{Key: key, Value: raw})
+			}
 		}
 	} else {
 		candidates, _ = e.st.Prefix(rowPrefix+table+":", 0)
@@ -345,27 +347,65 @@ func (e *Executor) matchingRows(table string, s *schema, where Expr) ([]storedRo
 	return out, nil
 }
 
-// pkLookup recognises WHERE pk = literal (either way round).
-func pkLookup(table string, s *schema, where Expr) (string, bool) {
-	b, ok := where.(Binary)
+// pkLookup recognises "WHERE pk = literal" (either way round) and
+// "WHERE pk IN (literal, ...)", and returns the row keys to fetch, sorted and
+// without repeats so rows come back in the same order as a full table read.
+// Anything it can't turn into a key exactly (a value of the wrong type, say)
+// makes it give up, and the caller falls back to reading every row, so the
+// answer, or the error, is always the same as without the shortcut.
+func pkLookup(table string, s *schema, where Expr) ([]string, bool) {
 	pk := s.pk()
-	if !ok || b.Op != "=" || pk < 0 {
-		return "", false
+	if pk < 0 {
+		return nil, false
 	}
-	c, l := b.Left, b.Right
-	if _, isLit := c.(Literal); isLit {
-		c, l = l, c
+	isPK := func(ex Expr) bool {
+		ref, ok := ex.(ColumnRef)
+		return ok && ref.Name == s.Columns[pk].Name
 	}
-	ref, ok1 := c.(ColumnRef)
-	lit, ok2 := l.(Literal)
-	if !ok1 || !ok2 || ref.Name != s.Columns[pk].Name {
-		return "", false
+	var lits []Expr
+	switch x := where.(type) {
+	case Binary:
+		if x.Op != "=" {
+			return nil, false
+		}
+		c, l := x.Left, x.Right
+		if _, isLit := c.(Literal); isLit {
+			c, l = l, c
+		}
+		if !isPK(c) {
+			return nil, false
+		}
+		lits = []Expr{l}
+	case In:
+		if x.Negate || !isPK(x.Expr) {
+			return nil, false
+		}
+		lits = x.List
+	default:
+		return nil, false
 	}
-	v, err := coerce(lit.Value, s.Columns[pk])
-	if err != nil || v == nil {
-		return "", false
+
+	var keys []string
+	seen := map[string]bool{}
+	for _, ex := range lits {
+		lit, ok := ex.(Literal)
+		if !ok {
+			return nil, false
+		}
+		if lit.Value == nil {
+			continue // pk = NULL never matches, and a pk is never NULL anyway
+		}
+		v, err := coerce(lit.Value, s.Columns[pk])
+		if err != nil {
+			return nil, false
+		}
+		if k := rowKey(table, v); !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
 	}
-	return rowKey(table, v), true
+	sort.Strings(keys)
+	return keys, true
 }
 
 func (e *Executor) selectRows(sel Select) (Result, error) {
@@ -659,6 +699,14 @@ func havingAggregates(ex Expr, found []Aggregate) []Aggregate {
 		return havingAggregates(x.Expr, found)
 	case IsNull:
 		return havingAggregates(x.Expr, found)
+	case In:
+		found = havingAggregates(x.Expr, found)
+		for _, item := range x.List {
+			found = havingAggregates(item, found)
+		}
+		return found
+	case Like:
+		return havingAggregates(x.Pattern, havingAggregates(x.Expr, found))
 	}
 	return found
 }
@@ -696,6 +744,25 @@ func bindGroup(ex Expr, sel Select, s *schema, g *group) (Expr, error) {
 	case IsNull:
 		e, err := bindGroup(x.Expr, sel, s, g)
 		return IsNull{Expr: e, Negate: x.Negate}, err
+	case In:
+		e, err := bindGroup(x.Expr, sel, s, g)
+		if err != nil {
+			return nil, err
+		}
+		list := make([]Expr, len(x.List))
+		for i, item := range x.List {
+			if list[i], err = bindGroup(item, sel, s, g); err != nil {
+				return nil, err
+			}
+		}
+		return In{Expr: e, List: list, Negate: x.Negate}, nil
+	case Like:
+		e, err := bindGroup(x.Expr, sel, s, g)
+		if err != nil {
+			return nil, err
+		}
+		pat, err := bindGroup(x.Pattern, sel, s, g)
+		return Like{Expr: e, Pattern: pat, Negate: x.Negate}, err
 	}
 	return ex, nil
 }
@@ -885,6 +952,20 @@ func checkColumns(s *schema, ex Expr) error {
 		return checkColumns(s, x.Expr)
 	case IsNull:
 		return checkColumns(s, x.Expr)
+	case In:
+		if err := checkColumns(s, x.Expr); err != nil {
+			return err
+		}
+		for _, item := range x.List {
+			if err := checkColumns(s, item); err != nil {
+				return err
+			}
+		}
+	case Like:
+		if err := checkColumns(s, x.Expr); err != nil {
+			return err
+		}
+		return checkColumns(s, x.Pattern)
 	}
 	return nil
 }

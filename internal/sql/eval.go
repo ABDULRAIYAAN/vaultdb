@@ -84,12 +84,134 @@ func eval(ex Expr, s *schema, row []any) (any, error) {
 		}
 		return nil, fmt.Errorf("unknown operator %s", x.Op)
 
+	case In:
+		v, err := eval(x.Expr, s, row)
+		if err != nil {
+			return nil, err
+		}
+		return evalIn(v, x, s, row)
+
+	case Like:
+		v, err := eval(x.Expr, s, row)
+		if err != nil {
+			return nil, err
+		}
+		pat, err := eval(x.Pattern, s, row)
+		if err != nil || v == nil || pat == nil {
+			return nil, err
+		}
+		text, ok1 := v.(string)
+		ps, ok2 := pat.(string)
+		if !ok1 || !ok2 {
+			return nil, fmt.Errorf("LIKE needs TEXT on both sides, got %s LIKE %s", typeName(v), typeName(pat))
+		}
+		m, err := likeMatch(text, ps)
+		if err != nil {
+			return nil, err
+		}
+		return m != x.Negate, nil
+
 	case AggregateRef:
 		// groupRows swaps these for their values before calling eval, so
 		// reaching one here means an aggregate slipped in somewhere else.
 		return nil, fmt.Errorf("aggregate function %s can only be used in HAVING", x.Agg.Name())
 	}
 	return nil, fmt.Errorf("cannot evaluate %T", ex)
+}
+
+// evalIn works out "v IN (list)" once v is known. Each list value is compared
+// with v exactly like "=" would. The answer is TRUE on the first match. With
+// no match it is FALSE, unless v or some list value was NULL: then nobody
+// knows whether they would have matched, so the answer is NULL. That is why
+// "x NOT IN (1, NULL)" never keeps a row, the classic SQL surprise.
+func evalIn(v any, x In, s *schema, row []any) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	sawNull := false
+	for _, item := range x.List {
+		w, err := eval(item, s, row)
+		if err != nil {
+			return nil, err
+		}
+		if w == nil {
+			sawNull = true
+			continue
+		}
+		c, err := compare(v, w)
+		if err != nil {
+			return nil, err
+		}
+		if c == 0 {
+			return !x.Negate, nil
+		}
+	}
+	if sawNull {
+		return nil, nil
+	}
+	return x.Negate, nil
+}
+
+// likeMatch reports whether text matches a LIKE pattern: % is any run of
+// characters, _ is one character, and \ makes the next character literal.
+// It works on characters (runes), so _ matches one 'é', not half of it.
+//
+// The matcher is the classic two-pointer one used for shell globs: walk both
+// strings, and when a % is found remember where it was. On a mismatch, go
+// back to just after the last %, let it swallow one more character of text,
+// and try again. Only the most recent % ever needs revisiting, so this takes
+// at most len(text) * len(pattern) steps and never blows up the way naive
+// recursion does on patterns like '%a%a%a%a%b'.
+func likeMatch(text, pattern string) (bool, error) {
+	// Compile the pattern into tokens first so escapes are handled once.
+	type tok struct {
+		r    rune
+		kind byte // 'c' literal character, '_' one character, '%' any run
+	}
+	var pat []tok
+	pr := []rune(pattern)
+	for i := 0; i < len(pr); i++ {
+		switch pr[i] {
+		case '\\':
+			if i+1 == len(pr) {
+				return false, fmt.Errorf("LIKE pattern %s ends with a lone backslash; use \\\\ to match a backslash", Format(pattern))
+			}
+			i++
+			pat = append(pat, tok{pr[i], 'c'})
+		case '%':
+			if len(pat) == 0 || pat[len(pat)-1].kind != '%' { // %% is the same as %
+				pat = append(pat, tok{kind: '%'})
+			}
+		case '_':
+			pat = append(pat, tok{kind: '_'})
+		default:
+			pat = append(pat, tok{pr[i], 'c'})
+		}
+	}
+
+	tr := []rune(text)
+	ti, pi := 0, 0
+	star, starText := -1, 0 // last % seen in the pattern, and where text was then
+	for ti < len(tr) {
+		switch {
+		case pi < len(pat) && pat[pi].kind == '%':
+			star, starText = pi, ti
+			pi++
+		case pi < len(pat) && (pat[pi].kind == '_' || pat[pi].r == tr[ti]):
+			ti++
+			pi++
+		case star >= 0:
+			starText++
+			ti, pi = starText, star+1
+		default:
+			return false, nil
+		}
+	}
+	// Text used up: whatever is left of the pattern must be %s.
+	for pi < len(pat) && pat[pi].kind == '%' {
+		pi++
+	}
+	return pi == len(pat), nil
 }
 
 // compare returns -1, 0 or 1. Whole numbers and decimals can be compared with

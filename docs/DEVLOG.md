@@ -64,3 +64,21 @@ How it works:
 While testing I found that `0.0` and `-0.0` landed in different `GROUP BY` groups because their JSON text differs (`0` vs `-0`). Grouping and `DISTINCT` now share one `valuesKey` helper that turns `-0.0` into `0.0` first, with a test for both.
 
 Next on the SQL side: simple `JOIN`s, or `IN (...)` and `LIKE` in conditions.
+
+## 2026-11-14: IN and LIKE
+
+Added `IN (...)` and `LIKE` to conditions, each with a `NOT` form: `WHERE id IN (1, 3, 7)`, `WHERE name LIKE 'A%'`, `WHERE dept NOT IN ('eng', 'ops')`. They work anywhere a condition does, so `UPDATE`, `DELETE` and `HAVING` get them too.
+
+Why: until now "is it one of these values?" meant a long chain of `OR`s, and there was no way at all to search text by prefix or pattern. Both are things you reach for in the first five minutes with any SQL database.
+
+How it works:
+
+- Two new AST nodes, `In` and `Like`. `IN` and `LIKE` are now reserved words. The parser handles them at the comparison level, next to `IS NULL`, and a `NOT` straight after a value can only mean `NOT IN` or `NOT LIKE`, so `a NOT = 1` gets a clear error. `IN ()` with nothing inside is rejected.
+- `IN` compares with the same `compare` that `=` uses, and follows the SQL NULL rules: a match is TRUE, no match is FALSE, but no match when the list has a `NULL` is NULL. That means `x NOT IN (1, NULL)` never keeps a row, which surprises everyone the first time, but it's what Postgres and SQLite do, so I matched it and wrote it down in the README.
+- `LIKE` compiles the pattern into tokens (literal, `_`, `%`, with `\` as the escape) and then runs the two-pointer glob matcher: remember the last `%`, and on a mismatch go back there and let it eat one more character. That's at most text × pattern steps, so a pattern like `'%a%a%a%a%b'` can't blow up the way a naive recursive matcher does. It works on runes, so `_` matches `é` as one character. It's case-sensitive, like Postgres.
+- The primary key shortcut grew: `WHERE id IN (3, 1, 7)` now does one key lookup per value instead of scanning the table. Keys are sorted and de-duplicated so rows come back in the same order a scan would give. If any value can't be turned into a key exactly (like `1.0` for an `INT` key) it falls back to the scan, so the shortcut can never change an answer.
+- The four places that walk expressions (`checkColumns`, `checkHavingColumns`, `havingAggregates`, `bindGroup`) learned the new nodes, which is how `HAVING COUNT(*) IN (1, 3)` works with no extra code in the evaluator.
+
+Tests: parser and executor cases for both, including the `NOT IN` + `NULL` trap and the pk lookup fallback, plus a fuzz test (`FuzzLikeMatch`) that checks the matcher against Go's `regexp` package on random text and patterns. It ran clean for about 600k inputs.
+
+Next on the SQL side: `BETWEEN`, or simple `JOIN`s.
