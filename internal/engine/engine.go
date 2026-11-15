@@ -44,6 +44,7 @@ SQL (tables are stored as keys under sql:):
   INSERT INTO students VALUES (1, 'Ali', 3.5, TRUE), (2, 'Sara', 3.8, FALSE)
   SELECT name, gpa FROM students WHERE gpa > 3.6 ORDER BY gpa DESC LIMIT 10
   SELECT * FROM students WHERE id IN (1, 2)  |  ... WHERE name LIKE 'A%'
+  SELECT name FROM students WHERE gpa BETWEEN 3.5 AND 4  |  ... WHERE id NOT BETWEEN 1 AND 2
   SELECT COUNT(*), AVG(gpa), MAX(gpa) FROM students WHERE active = TRUE
   SELECT active, COUNT(*), AVG(gpa) FROM students GROUP BY active ORDER BY COUNT(*) DESC
   SELECT active, COUNT(*) FROM students GROUP BY active HAVING AVG(gpa) > 3.5

@@ -463,6 +463,12 @@ func checkHavingColumns(ex Expr, groupBy []string) error {
 			return err
 		}
 		return checkHavingColumns(x.Pattern, groupBy)
+	case Between:
+		for _, e := range []Expr{x.Expr, x.Low, x.High} {
+			if err := checkHavingColumns(e, groupBy); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -535,7 +541,8 @@ func (p *parser) identList(what string) ([]string, error) {
 // Expressions, from loosest to tightest binding:
 //
 //	OR  <  AND  <  NOT  <  comparison (= != <> < <= > >=, IS [NOT] NULL,
-//	                                  [NOT] IN (...), [NOT] LIKE)  <  value
+//	                                  [NOT] IN (...), [NOT] LIKE,
+//	                                  [NOT] BETWEEN a AND b)  <  value
 //
 // So "a = 1 OR b = 2 AND c = 3" means "a = 1 OR (b = 2 AND c = 3)", exactly
 // like in real SQL. Each level calls the next tighter one for its operands.
@@ -584,8 +591,8 @@ func (p *parser) comparison() (Expr, error) {
 		}
 		return IsNull{Expr: left, Negate: negate}, nil
 	}
-	// "a NOT IN (...)" and "a NOT LIKE p": a NOT straight after a value can
-	// only belong to one of these.
+	// "a NOT IN (...)", "a NOT LIKE p" and "a NOT BETWEEN x AND y": a NOT
+	// straight after a value can only belong to one of these.
 	negate := p.acceptKeyword("NOT")
 	switch {
 	case p.acceptKeyword("IN"):
@@ -600,8 +607,24 @@ func (p *parser) comparison() (Expr, error) {
 			return nil, err
 		}
 		return Like{Expr: left, Pattern: pattern, Negate: negate}, nil
+	case p.acceptKeyword("BETWEEN"):
+		// The bounds are plain values, not full conditions, so the AND here
+		// is always BETWEEN's own: "a BETWEEN 1 AND 5 AND b = 2" is
+		// "(a BETWEEN 1 AND 5) AND b = 2".
+		low, err := p.value()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptKeyword("AND") {
+			return nil, p.errorf("expected AND between the two ends of BETWEEN, found %s", describe(p.peek()))
+		}
+		high, err := p.value()
+		if err != nil {
+			return nil, err
+		}
+		return Between{Expr: left, Low: low, High: high, Negate: negate}, nil
 	case negate:
-		return nil, p.errorf("expected IN or LIKE after NOT, found %s", describe(p.peek()))
+		return nil, p.errorf("expected IN, LIKE or BETWEEN after NOT, found %s", describe(p.peek()))
 	}
 	t := p.peek()
 	if t.Kind == TokSymbol {

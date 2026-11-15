@@ -38,6 +38,7 @@ type Store interface {
 	Set(key, value string) error
 	Delete(key string) (bool, error)
 	Prefix(prefix string, limit int) ([]store.KV, bool)
+	Scan(from, to string, limit int) ([]store.KV, bool)
 }
 
 // Executor runs parsed statements against a Store.
@@ -314,7 +315,8 @@ type storedRow struct {
 
 // matchingRows returns every row of the table that passes where. If where is
 // "primary key = value" or "primary key IN (values)", it fetches just those
-// rows directly with a GET each instead of reading the whole table.
+// rows directly with a GET each instead of reading the whole table. If it is
+// "primary key BETWEEN a AND b", it reads only that slice of the B-tree.
 func (e *Executor) matchingRows(table string, s *schema, where Expr) ([]storedRow, error) {
 	var candidates []store.KV
 	if keys, ok := pkLookup(table, s, where); ok {
@@ -322,6 +324,10 @@ func (e *Executor) matchingRows(table string, s *schema, where Expr) ([]storedRo
 			if raw, err := e.st.Get(key); err == nil {
 				candidates = append(candidates, store.KV{Key: key, Value: raw})
 			}
+		}
+	} else if from, to, ok := pkRange(table, s, where); ok {
+		if from < to {
+			candidates, _ = e.st.Scan(from, to, 0)
 		}
 	} else {
 		candidates, _ = e.st.Prefix(rowPrefix+table+":", 0)
@@ -406,6 +412,46 @@ func pkLookup(table string, s *schema, where Expr) ([]string, bool) {
 	}
 	sort.Strings(keys)
 	return keys, true
+}
+
+// pkRange recognises "WHERE pk BETWEEN literal AND literal" and returns the
+// slice of row keys [from, to) that holds exactly the matching rows. That
+// only works when key order is the same as value order: true for INT keys
+// (written as fixed-width hex with the sign bit flipped) and for TEXT keys
+// (the text itself, and TEXT compares byte by byte). FLOAT keys are written
+// with %v, whose order isn't number order, so those, like anything else it
+// can't turn into keys exactly, fall back to reading the whole table.
+//
+// The upper end is inclusive, so to is the high key plus a zero byte: the
+// smallest string that sorts after it. A NULL end means no row can match,
+// which the caller sees as from >= to.
+func pkRange(table string, s *schema, where Expr) (from, to string, ok bool) {
+	b, isBetween := where.(Between)
+	pk := s.pk()
+	if !isBetween || b.Negate || pk < 0 {
+		return "", "", false
+	}
+	col := s.Columns[pk]
+	if col.Type != TypeInt && col.Type != TypeText {
+		return "", "", false
+	}
+	if ref, isRef := b.Expr.(ColumnRef); !isRef || ref.Name != col.Name {
+		return "", "", false
+	}
+	low, okLow := b.Low.(Literal)
+	high, okHigh := b.High.(Literal)
+	if !okLow || !okHigh {
+		return "", "", false
+	}
+	if low.Value == nil || high.Value == nil {
+		return "", "", true // a pk is never NULL, so nothing matches
+	}
+	lv, err1 := coerce(low.Value, col)
+	hv, err2 := coerce(high.Value, col)
+	if err1 != nil || err2 != nil {
+		return "", "", false
+	}
+	return rowKey(table, lv), rowKey(table, hv) + "\x00", true
 }
 
 func (e *Executor) selectRows(sel Select) (Result, error) {
@@ -707,6 +753,8 @@ func havingAggregates(ex Expr, found []Aggregate) []Aggregate {
 		return found
 	case Like:
 		return havingAggregates(x.Pattern, havingAggregates(x.Expr, found))
+	case Between:
+		return havingAggregates(x.High, havingAggregates(x.Low, havingAggregates(x.Expr, found)))
 	}
 	return found
 }
@@ -763,6 +811,15 @@ func bindGroup(ex Expr, sel Select, s *schema, g *group) (Expr, error) {
 		}
 		pat, err := bindGroup(x.Pattern, sel, s, g)
 		return Like{Expr: e, Pattern: pat, Negate: x.Negate}, err
+	case Between:
+		var parts [3]Expr
+		for i, item := range []Expr{x.Expr, x.Low, x.High} {
+			var err error
+			if parts[i], err = bindGroup(item, sel, s, g); err != nil {
+				return nil, err
+			}
+		}
+		return Between{Expr: parts[0], Low: parts[1], High: parts[2], Negate: x.Negate}, nil
 	}
 	return ex, nil
 }
@@ -966,6 +1023,12 @@ func checkColumns(s *schema, ex Expr) error {
 			return err
 		}
 		return checkColumns(s, x.Pattern)
+	case Between:
+		for _, item := range []Expr{x.Expr, x.Low, x.High} {
+			if err := checkColumns(s, item); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

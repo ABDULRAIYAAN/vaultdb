@@ -82,3 +82,20 @@ How it works:
 Tests: parser and executor cases for both, including the `NOT IN` + `NULL` trap and the pk lookup fallback, plus a fuzz test (`FuzzLikeMatch`) that checks the matcher against Go's `regexp` package on random text and patterns. It ran clean for about 600k inputs.
 
 Next on the SQL side: `BETWEEN`, or simple `JOIN`s.
+
+## 2026-11-15: BETWEEN
+
+Added `BETWEEN` and `NOT BETWEEN` to conditions: `WHERE gpa BETWEEN 3.5 AND 4`, `WHERE id NOT BETWEEN 2 AND 3`, `HAVING COUNT(*) BETWEEN 2 AND 5`. Both ends are included.
+
+Why: ranges are one of the most common filters there is (dates, prices, scores, id ranges), and writing `x >= a AND x <= b` every time is noisy. It was also a chance to make range queries on the primary key fast, which nothing used yet even though the B-tree has supported range walks since v0.4.0.
+
+How it works:
+
+- New AST node `Between` (value, low end, high end, `Negate`), and `BETWEEN` is now a reserved word. The parser reads it at the comparison level next to `IN` and `LIKE`. The ends are read as plain values, not whole conditions, so the `AND` inside `BETWEEN` can never be confused with a normal `AND`: `a BETWEEN 1 AND 5 AND b = 2` is `(a BETWEEN 1 AND 5) AND b = 2`, same as Postgres.
+- I gave it its own node and `evalBetween` instead of rewriting it into `x >= a AND x <= b` in the parser. The reason is NULLs: the standard says `x BETWEEN a AND b` is the two comparisons joined with three-valued `AND` (FALSE beats NULL, NULL beats TRUE), so `9 BETWEEN NULL AND 5` is FALSE and `9 NOT BETWEEN NULL AND 5` is TRUE. `evalBetween` does exactly that. All three values are evaluated first so a type mistake is reported even when one end already decides the answer.
+- Primary key shortcut: `pkRange` spots `WHERE pk BETWEEN literal AND literal` and turns it into one `Scan(from, to)` over the B-tree, instead of reading every row. `to` is the high key plus a `\x00` byte, the smallest string that sorts after it, which turns the store's half-open `[from, to)` into an inclusive range. It only does this for `INT` keys (fixed-width hex with the sign bit flipped, so key order is number order) and `TEXT` keys (the text itself). `FLOAT` keys, mixed types like `id BETWEEN 0.5 AND 2.5`, and `NOT BETWEEN` fall back to the normal scan, so the shortcut can never change an answer. The executor's `Store` interface gained `Scan` for this.
+- The four expression walkers (`checkColumns`, `checkHavingColumns`, `havingAggregates`, `bindGroup`) learned the new node, so `HAVING` works with no extra evaluator code.
+
+Tests: parser cases for precedence and errors, executor cases for ends, NULL rules, columns as ends, `HAVING`, `UPDATE`/`DELETE`, and a `TEXT` primary key next to a table with a similar name (so a range can't leak into the neighbouring table's keys). `TestBetweenMatchesComparisons` runs 300 random ranges, including the int64 extremes and reversed ends, against both an `INT` and a `TEXT` key and checks the shortcut gives the same rows as `>= AND <=` while never doing a full table read. I also checked it catches a real bug: dropping the `\x00` makes six tests fail.
+
+One thing I noticed while writing the NULL cases: plain `AND`/`OR` in `eval` treat NULL like FALSE (`l == true && r == true`), so `NOT (x > 1 AND y > 1)` with `y` NULL comes out TRUE when standard SQL says NULL. `BETWEEN` doesn't go through that path, so it's correct, but fixing `AND`/`OR` to proper three-valued logic is next.

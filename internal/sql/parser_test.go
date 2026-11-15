@@ -149,6 +149,14 @@ func TestPrecedence(t *testing.T) {
 		`NOT a LIKE 'x%' AND b = 2`:  bin("AND", Not{Expr: Like{Expr: col("a"), Pattern: lit("x%")}}, b),
 		`a NOT LIKE b`:               Like{Expr: col("a"), Pattern: col("b"), Negate: true},
 		`a = 1 AND b = 2 AND c = 3`:  bin("AND", bin("AND", a, b), c), // left to right
+
+		// BETWEEN's AND belongs to BETWEEN; the next AND joins conditions.
+		`a BETWEEN 1 AND 5 AND b = 2`:      bin("AND", Between{Expr: col("a"), Low: lit(int64(1)), High: lit(int64(5))}, b),
+		`a NOT BETWEEN b AND -3 OR c = 3`:  bin("OR", Between{Expr: col("a"), Low: col("b"), High: lit(int64(-3)), Negate: true}, c),
+		`NOT a BETWEEN 'a' AND 'm'`:        Not{Expr: Between{Expr: col("a"), Low: lit("a"), High: lit("m")}},
+		`a BETWEEN (b = 2) AND (c = 3)`:    Between{Expr: col("a"), Low: b, High: c},
+		`(a BETWEEN 1 AND 5) IS NULL`:      IsNull{Expr: Between{Expr: col("a"), Low: lit(int64(1)), High: lit(int64(5))}},
+		`a BETWEEN NULL AND 2.5 AND c = 3`: bin("AND", Between{Expr: col("a"), Low: lit(nil), High: lit(2.5)}, c),
 	}
 	for where, want := range cases {
 		st, err := Parse("SELECT * FROM t WHERE " + where)
@@ -200,10 +208,16 @@ func TestParseErrors(t *testing.T) {
 		`SELECT * FROM t WHERE a IN ()`:                                                  "IN needs at least one value",
 		`SELECT * FROM t WHERE a IN 1, 2`:                                                `expected "("`,
 		`SELECT * FROM t WHERE a IN (1, 2`:                                               `expected ")"`,
-		`SELECT * FROM t WHERE a NOT = 1`:                                                "expected IN or LIKE after NOT",
+		`SELECT * FROM t WHERE a NOT = 1`:                                                "expected IN, LIKE or BETWEEN after NOT",
 		`SELECT * FROM t WHERE a LIKE`:                                                   "expected a value",
 		`SELECT dept FROM t GROUP BY dept HAVING name LIKE 'A%'`:                         "name in HAVING must be listed in GROUP BY",
 		`SELECT dept FROM t GROUP BY dept HAVING dept IN (name)`:                         "name in HAVING must be listed in GROUP BY",
+		`SELECT * FROM t WHERE a BETWEEN 1 OR 5`:                                         "expected AND between the two ends of BETWEEN",
+		`SELECT * FROM t WHERE a BETWEEN 1`:                                              "expected AND between the two ends of BETWEEN",
+		`SELECT * FROM t WHERE a BETWEEN AND 5`:                                          "expected a value",
+		`SELECT * FROM t WHERE a BETWEEN 1 AND`:                                          "expected a value",
+		`SELECT * FROM t WHERE a BETWEEN COUNT(*) AND 5`:                                 "not allowed here; use HAVING",
+		`SELECT dept FROM t GROUP BY dept HAVING dept BETWEEN 'a' AND name`:              "name in HAVING must be listed in GROUP BY",
 	}
 	for q, wantMsg := range cases {
 		_, err := Parse(q)

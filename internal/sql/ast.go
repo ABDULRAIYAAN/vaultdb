@@ -198,6 +198,16 @@ type Like struct {
 	Negate  bool
 }
 
+// Between is "Expr BETWEEN Low AND High" or, with Negate, "Expr NOT BETWEEN
+// Low AND High". Both ends are included, so "age BETWEEN 18 AND 21" keeps 18,
+// 19, 20 and 21. It means exactly "Expr >= Low AND Expr <= High", NULL rules
+// included: a NULL anywhere makes the answer NULL, unless the other end
+// already rules the value out (5 BETWEEN NULL AND 3 is FALSE).
+type Between struct {
+	Expr, Low, High Expr
+	Negate          bool
+}
+
 // AggregateRef is an aggregate used inside an expression, like COUNT(*) in
 // "HAVING COUNT(*) > 1". The parser only allows it in HAVING; the executor
 // replaces it with the group's value before evaluating.
@@ -210,4 +220,5 @@ func (Not) expr()          {}
 func (IsNull) expr()       {}
 func (In) expr()           {}
 func (Like) expr()         {}
+func (Between) expr()      {}
 func (AggregateRef) expr() {}

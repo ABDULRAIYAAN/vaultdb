@@ -111,6 +111,9 @@ func eval(ex Expr, s *schema, row []any) (any, error) {
 		}
 		return m != x.Negate, nil
 
+	case Between:
+		return evalBetween(x, s, row)
+
 	case AggregateRef:
 		// groupRows swaps these for their values before calling eval, so
 		// reaching one here means an aggregate slipped in somewhere else.
@@ -150,6 +153,52 @@ func evalIn(v any, x In, s *schema, row []any) (any, error) {
 		return nil, nil
 	}
 	return x.Negate, nil
+}
+
+// evalBetween works out "v BETWEEN low AND high" as the two comparisons
+// v >= low and v <= high, joined with SQL's three-valued AND: FALSE if either
+// side is FALSE, otherwise NULL if either side is NULL, otherwise TRUE. So a
+// NULL end doesn't always give NULL: 9 BETWEEN NULL AND 5 is FALSE, because
+// 9 <= 5 already fails whatever the missing end would have been. NOT BETWEEN
+// flips TRUE and FALSE and leaves NULL alone.
+//
+// All three values are worked out first, so a type mistake such as
+// 5 BETWEEN 'a' AND 10 is reported even when the other end decides alone.
+func evalBetween(x Between, s *schema, row []any) (any, error) {
+	var vals [3]any
+	for i, e := range []Expr{x.Expr, x.Low, x.High} {
+		v, err := eval(e, s, row)
+		if err != nil {
+			return nil, err
+		}
+		vals[i] = v
+	}
+	v, low, high := vals[0], vals[1], vals[2]
+	side := func(a, b any) (any, error) { // a <= b, or NULL
+		if a == nil || b == nil {
+			return nil, nil
+		}
+		c, err := compare(a, b)
+		if err != nil {
+			return nil, err
+		}
+		return c <= 0, nil
+	}
+	aboveLow, err := side(low, v)
+	if err != nil {
+		return nil, err
+	}
+	belowHigh, err := side(v, high)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case aboveLow == false || belowHigh == false:
+		return x.Negate, nil
+	case aboveLow == nil || belowHigh == nil:
+		return nil, nil
+	}
+	return !x.Negate, nil
 }
 
 // likeMatch reports whether text matches a LIKE pattern: % is any run of

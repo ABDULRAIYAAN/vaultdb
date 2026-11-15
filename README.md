@@ -8,7 +8,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN` and `LIKE`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -237,7 +237,7 @@ vaultdb> SELECT name, gpa FROM students WHERE gpa > 3.5 ORDER BY gpa DESC
 (2 rows)
 ```
 
-Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, `DISTINCT`, aggregates, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] IN (...)`, `[NOT] LIKE` and brackets.
+Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, `DISTINCT`, aggregates, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] IN (...)`, `[NOT] LIKE`, `[NOT] BETWEEN ... AND ...` and brackets.
 
 ### IN and LIKE
 
@@ -266,6 +266,32 @@ vaultdb> SELECT name FROM students WHERE name LIKE '%a_'
 - `WHERE id IN (3, 1, 7)` on the primary key doesn't read the table: it does one key lookup per value, like `WHERE id = 3` does.
 
 How `LIKE` runs: two pointers walk the text and the pattern. On a `%` the matcher remembers where it was; on a mismatch it jumps back there and lets the `%` swallow one more character. Only the last `%` ever needs revisiting, so a nasty pattern like `'%a%a%a%a%b'` can't make it take exponential time. A fuzz test checks it against Go's `regexp` package on random inputs.
+
+### BETWEEN
+
+```
+vaultdb> SELECT name, gpa FROM students WHERE gpa BETWEEN 3.5 AND 4
++-----------+-----+
+| name      | gpa |
++-----------+-----+
+| 'Raiyaan' | 3.9 |
+| 'Sara'    | 3.6 |
++-----------+-----+
+(2 rows)
+vaultdb> SELECT id, name FROM students WHERE id NOT BETWEEN 2 AND 3
++----+-----------+
+| id | name      |
++----+-----------+
+| 1  | 'Raiyaan' |
++----+-----------+
+(1 row)
+```
+
+`x BETWEEN a AND b` is a shorter `x >= a AND x <= b`: both ends are included. It works on numbers, text and booleans, has a `NOT` form, and works in `WHERE`, `HAVING`, `UPDATE` and `DELETE` (`HAVING COUNT(*) BETWEEN 2 AND 5`).
+
+- The ends must be in order: `BETWEEN 10 AND 1` matches nothing, as in Postgres and SQLite.
+- `NULL` follows standard SQL, which is a little subtle here. A `NULL` value is never between anything. A `NULL` end makes the answer unknown, unless the other end already rules the value out: `9 BETWEEN NULL AND 5` is `FALSE`, because 9 is above 5 whatever the missing end is. So `id NOT BETWEEN NULL AND 5` still keeps the rows with `id > 5`.
+- `WHERE id BETWEEN 100 AND 200` on an `INT` or `TEXT` primary key doesn't read the whole table: it walks just that slice of the B-tree.
 
 ### Aggregate functions
 
@@ -377,7 +403,7 @@ sql:row:students:8000000000000001     [1,"Raiyaan",3.9]
 sql:row:students:8000000000000002     [2,"Ali",3.2]
 ```
 
-Because the store is a B-tree, a table's rows sit next to each other, so a full table read is one prefix walk. `WHERE id = 2` on the primary key skips the walk and does a single key lookup, and `WHERE id IN (2, 5)` does one per value. Integer keys are written as 16 hex digits with the sign bit flipped, so key order matches number order, negatives included.
+Because the store is a B-tree, a table's rows sit next to each other, so a full table read is one prefix walk. `WHERE id = 2` on the primary key skips the walk and does a single key lookup, and `WHERE id IN (2, 5)` does one per value. Integer keys are written as 16 hex digits with the sign bit flipped, so key order matches number order, negatives included. That's what makes `WHERE id BETWEEN 10 AND 20` cheap: the rows it wants are one unbroken run of keys, so it's a single B-tree range walk from the key for 10 to the key for 20. Text keys are the text itself, so they get the same shortcut; `FLOAT` keys don't sort in number order as text, so they fall back to a full read.
 
 Rules the executor enforces: types must match the column (an `INT` is accepted in a `FLOAT` column), primary keys must be unique and not `NULL`, a multi-row `INSERT` is checked completely before any row is written, and comparing with `NULL` is never true (use `IS NULL`), as in standard SQL.
 

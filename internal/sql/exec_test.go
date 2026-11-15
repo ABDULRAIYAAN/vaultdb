@@ -3,6 +3,7 @@ package sql
 import (
 	"fmt"
 	"math"
+	"math/rand"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -620,6 +621,190 @@ func TestInAndLikeInHaving(t *testing.T) {
 	for _, c := range cases {
 		if got := rows(t, e, c.q); !reflect.DeepEqual(got, c.want) {
 			t.Errorf("%s\n got %v\nwant %v", c.q, got, c.want)
+		}
+	}
+}
+
+func TestBetween(t *testing.T) {
+	e := setup(t) // ids -5, 1, 2, 3: Old (gpa NULL), Ali, Sara, Raiyaan
+	cases := []struct {
+		q    string
+		want [][]any
+	}{
+		// On the primary key this reads only the slice of keys it needs.
+		{`SELECT name FROM students WHERE id BETWEEN 1 AND 2`, [][]any{{"Ali"}, {"Sara"}}}, // both ends included
+		{`SELECT name FROM students WHERE id BETWEEN -10 AND 1`, [][]any{{"Old"}, {"Ali"}}},
+		{`SELECT name FROM students WHERE id BETWEEN 3 AND 3`, [][]any{{"Raiyaan"}}},
+		{`SELECT name FROM students WHERE id BETWEEN 3 AND 1`, nil}, // wrong way round matches nothing, as in SQL
+		{`SELECT name FROM students WHERE id BETWEEN 4 AND 100`, nil},
+		{`SELECT name FROM students WHERE id BETWEEN NULL AND 3`, nil},
+		{`SELECT name FROM students WHERE id BETWEEN 0.5 AND 2.5`, [][]any{{"Ali"}, {"Sara"}}}, // FLOAT ends fall back to a scan
+		{`SELECT name FROM students WHERE id BETWEEN -9223372036854775808 AND 9223372036854775807`, [][]any{{"Old"}, {"Ali"}, {"Sara"}, {"Raiyaan"}}},
+		{`SELECT name FROM students WHERE id NOT BETWEEN 1 AND 2`, [][]any{{"Old"}, {"Raiyaan"}}},
+		{`SELECT name FROM students WHERE NOT id BETWEEN 1 AND 2`, [][]any{{"Old"}, {"Raiyaan"}}},
+		{`SELECT name FROM students WHERE id BETWEEN 1 AND 3 AND active = TRUE`, [][]any{{"Ali"}, {"Raiyaan"}}},
+		{`SELECT name FROM students WHERE id BETWEEN 1 AND 3 ORDER BY gpa DESC LIMIT 1`, [][]any{{"Raiyaan"}}},
+		{`SELECT COUNT(*) FROM students WHERE id BETWEEN 1 AND 3`, [][]any{{int64(3)}}},
+
+		// Other columns, and NULL rules.
+		{`SELECT name FROM students WHERE gpa BETWEEN 3.2 AND 3.6`, [][]any{{"Ali"}, {"Sara"}}},
+		{`SELECT name FROM students WHERE gpa BETWEEN 3 AND 4`, [][]any{{"Ali"}, {"Sara"}, {"Raiyaan"}}}, // INT ends on FLOAT
+		{`SELECT name FROM students WHERE gpa NOT BETWEEN 3.3 AND 4`, [][]any{{"Ali"}}},                  // NULL gpa is unknown, skipped
+		{`SELECT name FROM students WHERE (gpa BETWEEN 0 AND 4) IS NULL`, [][]any{{"Old"}}},
+		{`SELECT name FROM students WHERE name BETWEEN 'A' AND 'Rz'`, [][]any{{"Old"}, {"Ali"}, {"Raiyaan"}}},
+		{`SELECT name FROM students WHERE gpa BETWEEN id AND 3.7`, [][]any{{"Ali"}, {"Sara"}}}, // ends can be columns: 3.9 > 3.7, NULL gpa skipped
+		{`SELECT name FROM students WHERE active BETWEEN FALSE AND FALSE`, [][]any{{"Old"}, {"Sara"}}},
+
+		// A NULL end only gives NULL when the other end doesn't already say no.
+		{`SELECT name FROM students WHERE id BETWEEN NULL AND 1`, nil},                                 // NULL or FALSE, never TRUE
+		{`SELECT name FROM students WHERE id NOT BETWEEN NULL AND 1`, [][]any{{"Sara"}, {"Raiyaan"}}},  // 2 and 3 > 1: FALSE, so NOT is TRUE
+		{`SELECT name FROM students WHERE id NOT BETWEEN 2 AND NULL`, [][]any{{"Old"}, {"Ali"}}},       // -5 and 1 < 2
+		{`SELECT name FROM students WHERE (id BETWEEN NULL AND 1) IS NULL`, [][]any{{"Old"}, {"Ali"}}}, // the ones that could be in
+		{`SELECT name FROM students WHERE (id BETWEEN NULL AND NULL) IS NULL`, [][]any{{"Old"}, {"Ali"}, {"Sara"}, {"Raiyaan"}}},
+	}
+	for _, c := range cases {
+		if got := rows(t, e, c.q); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s\n got %v\nwant %v", c.q, got, c.want)
+		}
+	}
+
+	// UPDATE and DELETE use the same WHERE, including the pk range shortcut.
+	mustExec(t, e, `UPDATE students SET active = TRUE WHERE id BETWEEN -5 AND 2`)
+	if got := rows(t, e, `SELECT COUNT(*) FROM students WHERE active = TRUE`); got[0][0] != int64(4) {
+		t.Errorf("after UPDATE ... BETWEEN, active count = %v, want 4", got[0][0])
+	}
+	if r := mustExec(t, e, `DELETE FROM students WHERE id BETWEEN 1 AND 2`); r.Message != "OK, 2 rows deleted" {
+		t.Errorf("DELETE ... BETWEEN said %q", r.Message)
+	}
+	if got := rows(t, e, `SELECT id FROM students`); !reflect.DeepEqual(got, [][]any{{int64(-5)}, {int64(3)}}) {
+		t.Errorf("after DELETE ... BETWEEN, ids = %v", got)
+	}
+
+	for q, wantMsg := range map[string]string{
+		`SELECT * FROM students WHERE id BETWEEN 'a' AND 'z'`:      "cannot compare TEXT with INT",
+		`SELECT * FROM students WHERE id BETWEEN 1 AND 'z'`:        "cannot compare INT with TEXT",
+		`SELECT * FROM students WHERE name BETWEEN 1 AND 'z'`:      "cannot compare INT with TEXT",
+		`SELECT * FROM students WHERE nope BETWEEN 1 AND 2`:        "unknown column nope",
+		`SELECT * FROM students WHERE id BETWEEN nope AND 2`:       "unknown column nope",
+		`DELETE FROM students WHERE id NOT BETWEEN 1 AND nope`:     "unknown column nope",
+		`UPDATE students SET gpa = 1 WHERE gpa BETWEEN nope AND 1`: "unknown column nope",
+	} {
+		if _, err := e.Exec(q); err == nil || !strings.Contains(err.Error(), wantMsg) {
+			t.Errorf("%s\n error = %v, want it to mention %q", q, err, wantMsg)
+		}
+	}
+}
+
+// A TEXT primary key also gets the range shortcut, since its keys sort the
+// same way the text does. An empty table must still report bad columns.
+func TestBetweenTextKey(t *testing.T) {
+	e := NewExecutor(store.New())
+	mustExec(t, e, `CREATE TABLE words (w TEXT PRIMARY KEY, n INT)`)
+	if _, err := e.Exec(`SELECT * FROM words WHERE nope BETWEEN 1 AND 2`); err == nil {
+		t.Error("unknown column on an empty table was not reported")
+	}
+	mustExec(t, e, `INSERT INTO words VALUES ('apple', 1), ('b', 2), ('banana', 3), ('cherry', 4), ('', 0)`)
+	// A second table whose keys sit right next to these in the B-tree.
+	mustExec(t, e, `CREATE TABLE wordsx (w TEXT PRIMARY KEY)`)
+	mustExec(t, e, `INSERT INTO wordsx VALUES ('apple'), ('b')`)
+	cases := []struct {
+		q    string
+		want [][]any
+	}{
+		{`SELECT w FROM words WHERE w BETWEEN 'b' AND 'c'`, [][]any{{"b"}, {"banana"}}},
+		{`SELECT w FROM words WHERE w BETWEEN 'b' AND 'b'`, [][]any{{"b"}}}, // 'banana' sorts after 'b'
+		{`SELECT w FROM words WHERE w BETWEEN '' AND 'apple'`, [][]any{{""}, {"apple"}}},
+		{`SELECT w FROM words WHERE w BETWEEN 'a' AND 'zzz'`, [][]any{{"apple"}, {"b"}, {"banana"}, {"cherry"}}},
+		{`SELECT w FROM words WHERE w BETWEEN 'z' AND 'a'`, nil},
+		{`SELECT w FROM words WHERE w NOT BETWEEN 'b' AND 'c'`, [][]any{{""}, {"apple"}, {"cherry"}}},
+		{`SELECT w FROM wordsx WHERE w BETWEEN '' AND 'zzz'`, [][]any{{"apple"}, {"b"}}},
+	}
+	for _, c := range cases {
+		if got := rows(t, e, c.q); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s\n got %v\nwant %v", c.q, got, c.want)
+		}
+	}
+}
+
+func TestBetweenInHaving(t *testing.T) {
+	e := setupGroups(t)
+	cases := []struct {
+		q    string
+		want [][]any
+	}{
+		{`SELECT dept, COUNT(*) FROM staff GROUP BY dept HAVING COUNT(*) BETWEEN 2 AND 3`, [][]any{{"eng", int64(3)}, {"sales", int64(2)}}},
+		{`SELECT dept FROM staff GROUP BY dept HAVING AVG(salary) BETWEEN 70 AND 130`, [][]any{{"eng"}, {"sales"}}},
+		{`SELECT dept FROM staff GROUP BY dept HAVING MIN(salary) NOT BETWEEN 60 AND MAX(salary)`, [][]any{{nil}}},
+		{`SELECT dept FROM staff GROUP BY dept HAVING dept BETWEEN 'a' AND 'f'`, [][]any{{"eng"}}},
+	}
+	for _, c := range cases {
+		if got := rows(t, e, c.q); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s\n got %v\nwant %v", c.q, got, c.want)
+		}
+	}
+}
+
+// scanCounter wraps a store and counts full table reads, to check that the
+// primary key range shortcut really skips them.
+type scanCounter struct {
+	*store.Store
+	prefixReads int
+}
+
+func (s *scanCounter) Prefix(prefix string, limit int) ([]store.KV, bool) {
+	if strings.HasPrefix(prefix, rowPrefix) {
+		s.prefixReads++
+	}
+	return s.Store.Prefix(prefix, limit)
+}
+
+// The shortcut must give the same rows as the plain comparisons it stands
+// for, which always read the whole table. Random keys, including negatives
+// and the int64 extremes, and random bounds either way round.
+func TestBetweenMatchesComparisons(t *testing.T) {
+	st := &scanCounter{Store: store.New()}
+	e := NewExecutor(st)
+	mustExec(t, e, `CREATE TABLE n (id INT PRIMARY KEY)`)
+	mustExec(t, e, `CREATE TABLE s (k TEXT PRIMARY KEY)`)
+	rng := rand.New(rand.NewSource(1))
+	ints := []int64{math.MinInt64, math.MaxInt64, 0, -1}
+	for i := 0; i < 200; i++ {
+		ints = append(ints, rng.Int63n(2001)-1000)
+	}
+	for _, v := range ints {
+		e.Exec(fmt.Sprintf(`INSERT INTO n VALUES (%d)`, v)) // duplicates are refused, that's fine
+	}
+	word := func() string {
+		b := make([]byte, rng.Intn(4))
+		for i := range b {
+			b[i] = "ab~ "[rng.Intn(4)]
+		}
+		return string(b)
+	}
+	for i := 0; i < 100; i++ {
+		e.Exec(fmt.Sprintf(`INSERT INTO s VALUES ('%s')`, word()))
+	}
+
+	for i := 0; i < 300; i++ {
+		lo, hi := rng.Int63n(2201)-1100, rng.Int63n(2201)-1100
+		if i == 0 {
+			lo, hi = math.MinInt64, math.MaxInt64
+		}
+		before := st.prefixReads
+		got := rows(t, e, fmt.Sprintf(`SELECT id FROM n WHERE id BETWEEN %d AND %d`, lo, hi))
+		if st.prefixReads != before {
+			t.Fatalf("id BETWEEN %d AND %d read the whole table", lo, hi)
+		}
+		want := rows(t, e, fmt.Sprintf(`SELECT id FROM n WHERE id >= %d AND id <= %d`, lo, hi))
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("id BETWEEN %d AND %d\n got %v\nwant %v", lo, hi, got, want)
+		}
+
+		a, b := word(), word()
+		got = rows(t, e, fmt.Sprintf(`SELECT k FROM s WHERE k BETWEEN '%s' AND '%s'`, a, b))
+		want = rows(t, e, fmt.Sprintf(`SELECT k FROM s WHERE k >= '%s' AND k <= '%s'`, a, b))
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("k BETWEEN %q AND %q\n got %v\nwant %v", a, b, got, want)
 		}
 	}
 }
