@@ -1,0 +1,12 @@
+group,workload,ops,vaultdb_ns_per_op,sqlite_ns_per_op
+Key-value,"Write, fsync each (1000)",1000,161298,229409
+Key-value,"Write, no fsync (100k)",100000,1325,7094
+Key-value,"Write, one transaction (100k)",100000,1281,1895
+Key-value,Point read (100k keys),100000,596,4595
+Key-value,"Range scan, 100 keys (x10k)",10000,9228,60193
+Key-value,Reopen with 100k keys,1,45199305,5137885
+SQL,INSERT one row (20k),20000,9694,7470
+SQL,SELECT by primary key (20k),20000,8610,6385
+SQL,"SELECT pk BETWEEN, 100 rows (x1k)",1000,212020,46028
+SQL,"Full scan with filter, 20k rows (x20)",20,38517617,957226
+SQL,"GROUP BY with aggregates, 20k rows (x20)",20,47653343,4285908
