@@ -112,3 +112,24 @@ VaultDB is now 1.0. This release was about proving the work rather than adding f
 Numbers at 1.0: about 8,100 lines of Go and 3,700 lines of tests, 127 tests plus a fuzz test, 89.7% coverage of `internal/`.
 
 Next: a binary row format and a simple query planner, to close the SQL gap with SQLite.
+
+## 2026-11-16: Binary row format
+
+SQL rows are no longer stored as JSON. Each row is now a small binary record: a format byte (`0x01`), the number of values, then for each value a one-byte type tag and its data (`INT` as a zig-zag varint, `FLOAT` as its 8 IEEE 754 bytes, `TEXT` as a length and the bytes, `NULL`/`TRUE`/`FALSE` as just the tag). The code is in `internal/sql/row.go`.
+
+Why: the SQLite comparison showed full scans 40x slower than SQLite, and a quick profile-by-benchmark showed why: decoding one JSON row took 1.4 µs, and a scan of 20k rows took 38 ms, so about three quarters of every scan was just `encoding/json`. The roadmap's next step was "binary row format and a simple query planner", and this is the first half.
+
+How it works:
+
+- `encodeRow` appends tags and values into one buffer sized up front. `decodeRow` looks at the first byte: `0x01` means binary, anything else goes to the old JSON decoder. JSON rows always start with `[`, so the two can never be confused. That means databases written by v1.0.0 open as-is with no migration step, and an old row gets rewritten in binary the next time an `UPDATE` touches it. A test mixes both formats in one table to check this.
+- The decoder reads straight from the stored string with a tiny `rowReader` instead of converting to `[]byte`, which would copy every row, and text values are substrings of the row, so they cost no copy either. It went from 19 allocations per row to 5.
+- It's strict: the value count must match the schema, every tag must match its column's type (`NULL` fits anywhere), varints can't run past 64 bits, text lengths can't run past the end, and there can't be bytes left over. A damaged row gives "stored row is damaged" instead of a wrong answer.
+- Side fix: JSON can only hold valid UTF-8, so the old format silently turned bad bytes in `TEXT` into U+FFFD. Binary stores the bytes exactly. `TestTextIsStoredExactly` checks this across a restart.
+
+Numbers (in memory, 20k rows, median of 3, new `internal/sql/bench_test.go`): decoding one row 1.41 µs to 0.14 µs, full scan with filter 38.4 ms to 7.6 ms (5x), `GROUP BY` 52.4 ms to 15.2 ms (3.5x), 100-row primary key range 212 µs to 51 µs (4.2x), point lookup 9.0 µs to 6.3 µs. Rows aren't smaller on disk, though: a float takes 8 bytes where JSON might write `3.9`, so it's about a wash. The goal was decode speed, not size.
+
+Tests: round trips for every type including the int64 extremes, `-0.0`, `NaN`, infinities, empty and 300-byte strings and invalid UTF-8; a byte-by-byte layout test so the format can't change by accident; every truncated prefix of a valid row must be rejected; a list of hand-made damaged rows; and `FuzzDecodeRow`, which checks random bytes never panic and anything accepted survives another encode/decode. It ran clean for about 585k inputs. I also flipped the sign in the zig-zag decode on purpose and 12 tests failed, so the tests do catch a broken decoder.
+
+The SQLite comparison table in the README is still the v1.0.0 run; I'll re-run it with the C compiler setup before the next release.
+
+Next: a simple query planner, the other half of roadmap item 10.

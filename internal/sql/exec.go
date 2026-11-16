@@ -20,7 +20,7 @@ import (
 //
 //	sql:schema:students        -> {"columns":[{"name":"id","type":"INT","pk":true}, ...]}
 //	sql:seq:students           -> last automatic row id (tables without a primary key)
-//	sql:row:students:<key>     -> [1,"Ali",3.5,true]     one row, values in column order
+//	sql:row:students:<key>     -> one row, values in column order (binary, see row.go)
 //
 // Because the store is a B-tree, all rows of a table sit next to each other
 // (they share the prefix "sql:row:students:"), so reading a whole table is
@@ -282,30 +282,11 @@ func (e *Executor) insert(ins Insert) (Result, error) {
 }
 
 func (e *Executor) writeRow(key string, row []any) error {
-	raw, err := json.Marshal(row)
+	raw, err := encodeRow(row)
 	if err != nil {
 		return err
 	}
-	return e.st.Set(key, string(raw))
-}
-
-func decodeRow(raw string, s *schema) ([]any, error) {
-	dec := json.NewDecoder(strings.NewReader(raw))
-	dec.UseNumber() // keep 42 and 42.0 apart until we know the column type
-	var vals []any
-	if err := dec.Decode(&vals); err != nil || len(vals) != len(s.Columns) {
-		return nil, fmt.Errorf("stored row is damaged")
-	}
-	for i, v := range vals {
-		if num, ok := v.(json.Number); ok {
-			if s.Columns[i].Type == TypeInt {
-				vals[i], _ = num.Int64()
-			} else {
-				vals[i], _ = num.Float64()
-			}
-		}
-	}
-	return vals, nil
+	return e.st.Set(key, raw)
 }
 
 type storedRow struct {

@@ -12,9 +12,9 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 | | |
 |---|---|
-| Code | about 8,100 lines of Go, plus 3,700 lines of tests |
-| Tests | 127 tests and a fuzz test, all passing under Go's race detector |
-| Test coverage | 89.7% of the database packages (`internal/`) |
+| Code | about 8,100 lines of Go, plus 4,000 lines of tests |
+| Tests | 133 tests and 2 fuzz tests, all passing under Go's race detector |
+| Test coverage | 89.9% of the database packages (`internal/`) |
 | Dependencies | none: only the Go standard library |
 | Key-value reads | 597 ns per lookup at 100,000 keys, 7.7x faster than SQLite, which in turn wins every SQL query test ([details](#vaultdb-vs-sqlite)) |
 | Durable writes | 161 µs per write with fsync, 1.4x faster than SQLite |
@@ -23,7 +23,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -184,7 +184,7 @@ What the numbers mean:
 
 - **Key-value wins come from keeping everything in memory.** VaultDB holds every key in an in-memory B-tree and only appends to disk, so a read never touches the file. SQLite reads pages from its cache and also pays about 1.1 µs per call to cross from Go into C (measured with `SELECT 1`), which is part of every SQLite number above. The price VaultDB pays is RAM: the whole dataset must fit in memory, and SQLite has no such limit.
 - **Reopening is slower** because VaultDB replays its whole log to rebuild the B-tree, while SQLite's file already is the B-tree.
-- **SQL is where SQLite is far ahead.** VaultDB stores each row as JSON text and decodes every row a query touches, and it has no query planner, so scans and grouping are 11 to 40 times slower. Point queries are close because both mostly do one key lookup. A binary row format is the obvious next step.
+- **SQL is where SQLite is far ahead.** In v1.0.0 VaultDB stored each row as JSON text and decoded every row a query touched, and it has no query planner, so scans and grouping were 11 to 40 times slower. Point queries are close because both mostly do one key lookup. Since then rows are stored in a [binary format](#binary-rows), which makes the same SQL queries 3 to 5 times faster in VaultDB's own benchmarks; the table above is from v1.0.0 and will be re-run for the next release.
 - To keep it fair, SQLite's table uses `INTEGER PRIMARY KEY` (its fastest layout) and the key-value table is `WITHOUT ROWID`, one B-tree keyed by the key, the same shape as VaultDB's store. In the SQL rows, both databases parse the same query text every time, because VaultDB has no prepared statements.
 
 Run it yourself (needs a C compiler for SQLite):
@@ -450,13 +450,35 @@ How it runs: each result row is turned into a map key (the JSON text of its valu
 
 ```
 sql:schema:students                   {"columns":[{"name":"id","type":"INT","pk":true}, ...]}
-sql:row:students:8000000000000001     [1,"Raiyaan",3.9]
-sql:row:students:8000000000000002     [2,"Ali",3.2]
+sql:row:students:8000000000000001     "\x01\x03\x03\x02\x05\aRaiyaan\x04333333\x0f@"     (1, 'Raiyaan', 3.9)
+sql:row:students:8000000000000002     "\x01\x03\x03\x04\x05\x03Ali\x04\x9a\x99\x99\x99\x99\x99\t@"   (2, 'Ali', 3.2)
 ```
 
 Because the store is a B-tree, a table's rows sit next to each other, so a full table read is one prefix walk. `WHERE id = 2` on the primary key skips the walk and does a single key lookup, and `WHERE id IN (2, 5)` does one per value. Integer keys are written as 16 hex digits with the sign bit flipped, so key order matches number order, negatives included. That's what makes `WHERE id BETWEEN 10 AND 20` cheap: the rows it wants are one unbroken run of keys, so it's a single B-tree range walk from the key for 10 to the key for 20. Text keys are the text itself, so they get the same shortcut; `FLOAT` keys don't sort in number order as text, so they fall back to a full read.
 
 Rules the executor enforces: types must match the column (an `INT` is accepted in a `FLOAT` column), primary keys must be unique and not `NULL`, a multi-row `INSERT` is checked completely before any row is written, and comparing with `NULL` is never true (use `IS NULL`), as in standard SQL. `AND`, `OR` and `NOT` use SQL's three-valued logic: `FALSE AND NULL` is `FALSE` but `TRUE AND NULL` is `NULL`, so `NOT (a > 1 AND b > 1)` never keeps a row just because `b` is missing.
+
+### Binary rows
+
+Each row is one value in the store, written in a small binary format (`internal/sql/row.go`):
+
+```
+0x01 | count | tag value | tag value | ...
+```
+
+The first byte is the format version and `count` is the number of values. Each value is one tag byte saying its type, then its data: `INT` as a varint (small numbers take one byte), `FLOAT` as its 8 raw IEEE 754 bytes, `TEXT` as a length and the bytes, and `NULL`, `TRUE` and `FALSE` as just the tag. Reading a row is a walk along the bytes with no parsing, and text values are slices of the stored string, so they cost no copy.
+
+Up to v1.0.0 rows were JSON text like `[1,"Raiyaan",3.9]`, and decoding that was most of the cost of a table scan. A JSON row always starts with `[` and a binary one with `0x01`, so old databases open with no migration: old rows are read with the JSON decoder and rewritten in binary the next time an `UPDATE` touches them. The binary format also stores text exactly, where JSON had to replace bytes that aren't valid UTF-8.
+
+The decoder checks everything it reads (value count, each tag against the column type, lengths, no bytes left over) so a damaged row is reported instead of misread, and a fuzz test throws random bytes at it. Measured in memory on 20,000 rows, median of 3 runs (`go test ./internal/sql -run '^$' -bench .`):
+
+| Query | JSON rows (v1.0.0) | Binary rows | Faster by |
+|---|---|---|---|
+| Decode one row | 1.41 µs | 0.14 µs | 10x |
+| Full scan with filter | 38.4 ms | 7.6 ms | 5.0x |
+| `GROUP BY` with aggregates | 52.4 ms | 15.2 ms | 3.5x |
+| `WHERE id BETWEEN`, 100 rows | 212 µs | 51 µs | 4.2x |
+| `WHERE id = ...` | 9.0 µs | 6.3 µs | 1.4x |
 
 ## Commands
 
@@ -496,7 +518,7 @@ vaultdb/
   internal/engine/    runs commands, returns replies (reused by the TCP server later)
   internal/store/     the data: B-tree in memory, write-ahead rule, compaction
   internal/btree/     sorted in-memory index: insert with splits, delete with borrow/merge, range walks
-  internal/sql/       SQL lexer, recursive descent parser, AST, executor, result tables
+  internal/sql/       SQL lexer, recursive descent parser, AST, executor, binary row format, result tables
   internal/vector/    vectors, cosine/L2 distance, flat index, HNSW index, collections
   cmd/vaultdb-bench/  benchmark: exact vs HNSW speed and recall at several sizes, writes CSV
   bench/sqlite/       benchmark: VaultDB vs SQLite on the same workloads (separate Go module)
@@ -584,7 +606,8 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 8b. Engine compiled to WebAssembly, site hosted on Vercel
 - [x] 8c. v1.0 release: SQLite comparison, client tests, race-checked CI, three-valued `AND`/`OR`
 - [ ] 9. Custom domain for the playground
-- [ ] 10. Binary row format and a simple query planner, to close the SQL gap with SQLite
+- [x] 10a. Binary row format: SQL scans 3 to 5x faster, old JSON rows still readable
+- [ ] 10b. A simple query planner, to close the rest of the SQL gap with SQLite
 
 ## Author
 
