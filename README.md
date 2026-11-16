@@ -6,9 +6,24 @@ A database built from scratch in Go, one layer at a time: an in-memory key-value
 
 The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB, pgvector) work on the inside by building the same ideas by hand.
 
+[![tests](https://github.com/ABDULRAIYAAN/vaultdb/actions/workflows/test.yml/badge.svg)](https://github.com/ABDULRAIYAAN/vaultdb/actions/workflows/test.yml)
+
+## By the numbers
+
+| | |
+|---|---|
+| Code | about 8,100 lines of Go, plus 3,700 lines of tests |
+| Tests | 127 tests and a fuzz test, all passing under Go's race detector |
+| Test coverage | 89.7% of the database packages (`internal/`) |
+| Dependencies | none: only the Go standard library |
+| Key-value reads | 597 ns per lookup at 100,000 keys, 7.7x faster than SQLite, which in turn wins every SQL query test ([details](#vaultdb-vs-sqlite)) |
+| Durable writes | 161 µs per write with fsync, 1.4x faster than SQLite |
+| Vector search | HNSW is 81x faster than exact search at 100,000 vectors, with 99.5% recall |
+| AI providers | 11, for chat-with-your-documents |
+
 ## Status
 
-**v0.8.0: Milestone 7 complete.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -19,7 +34,7 @@ go run ./cmd/vaultdb
 ```
 
 ```
-VaultDB 0.8.0. Type HELP for commands, EXIT to quit.
+VaultDB 1.0.0. Type HELP for commands, EXIT to quit.
 Loaded 0 keys from data/vaultdb.log (0 log records).
 vaultdb> SET name raiyaan
 OK
@@ -32,7 +47,7 @@ Bye.
 Start it again and the data is still there:
 
 ```
-VaultDB 0.8.0. Type HELP for commands, EXIT to quit.
+VaultDB 1.0.0. Type HELP for commands, EXIT to quit.
 Loaded 2 keys from data/vaultdb.log (2 log records).
 vaultdb> GET name
 "raiyaan"
@@ -144,6 +159,42 @@ Exact search grows in step with the collection; HNSW barely grows, so the gap wi
 **efSearch is a dial between speed and accuracy.** On clustered data (which behaves like real embeddings, where topics form groups) efSearch 64 already finds 99.5% of the true neighbours at 100,000 vectors.
 
 **The honest worst case:** on uniformly random 128-dimension vectors, recall is much lower (23.5% at efSearch 64, 55.5% at 256). In high dimensions, random points are all almost the same distance apart (the "curse of dimensionality"), so "nearest" barely means anything and no graph shortcut can find it reliably. Real embeddings are not like that, which is why approximate indexes work in practice. The benchmark includes both so the numbers are not cherry-picked.
+
+## VaultDB vs SQLite
+
+The same workloads on the same machine (2-core Xeon at 2.1 GHz, Linux), against SQLite 3.54.1 in WAL mode through [go-sqlite3](https://github.com/mattn/go-sqlite3), median of 3 runs, both writing real files. Time per operation, lower is better. Raw numbers: [`docs/sqlite-comparison.csv`](docs/sqlite-comparison.csv).
+
+| Workload | VaultDB | SQLite | VaultDB is |
+|---|---|---|---|
+| **Key-value** | | | |
+| Write, fsync each (1,000) | 161.3 µs | 229.4 µs | 1.4x faster |
+| Write, no fsync (100k) | 1.3 µs | 7.1 µs | 5.4x faster |
+| Write, SQLite in one transaction (100k) | 1.3 µs | 1.9 µs | 1.5x faster |
+| Point read (100k keys) | 597 ns | 4.6 µs | 7.7x faster |
+| Range scan, 100 keys (x10k) | 9.2 µs | 60.2 µs | 6.5x faster |
+| Reopen with 100k keys | 45.20 ms | 5.14 ms | 8.8x slower |
+| **SQL** | | | |
+| INSERT one row (20k) | 9.7 µs | 7.5 µs | 1.3x slower |
+| SELECT by primary key (20k) | 8.6 µs | 6.4 µs | 1.3x slower |
+| SELECT pk BETWEEN, 100 rows (x1k) | 212.0 µs | 46.0 µs | 4.6x slower |
+| Full scan with filter, 20k rows (x20) | 38.52 ms | 957.2 µs | 40.2x slower |
+| GROUP BY with aggregates, 20k rows (x20) | 47.65 ms | 4.29 ms | 11.1x slower |
+
+What the numbers mean:
+
+- **Key-value wins come from keeping everything in memory.** VaultDB holds every key in an in-memory B-tree and only appends to disk, so a read never touches the file. SQLite reads pages from its cache and also pays about 1.1 µs per call to cross from Go into C (measured with `SELECT 1`), which is part of every SQLite number above. The price VaultDB pays is RAM: the whole dataset must fit in memory, and SQLite has no such limit.
+- **Reopening is slower** because VaultDB replays its whole log to rebuild the B-tree, while SQLite's file already is the B-tree.
+- **SQL is where SQLite is far ahead.** VaultDB stores each row as JSON text and decodes every row a query touches, and it has no query planner, so scans and grouping are 11 to 40 times slower. Point queries are close because both mostly do one key lookup. A binary row format is the obvious next step.
+- To keep it fair, SQLite's table uses `INTEGER PRIMARY KEY` (its fastest layout) and the key-value table is `WITHOUT ROWID`, one B-tree keyed by the key, the same shape as VaultDB's store. In the SQL rows, both databases parse the same query text every time, because VaultDB has no prepared statements.
+
+Run it yourself (needs a C compiler for SQLite):
+
+```bash
+cd bench/sqlite
+go run . -out ../../docs/sqlite-comparison.csv
+```
+
+It is a separate Go module, so VaultDB itself still has no dependencies.
 
 ## The playground website
 
@@ -405,7 +456,7 @@ sql:row:students:8000000000000002     [2,"Ali",3.2]
 
 Because the store is a B-tree, a table's rows sit next to each other, so a full table read is one prefix walk. `WHERE id = 2` on the primary key skips the walk and does a single key lookup, and `WHERE id IN (2, 5)` does one per value. Integer keys are written as 16 hex digits with the sign bit flipped, so key order matches number order, negatives included. That's what makes `WHERE id BETWEEN 10 AND 20` cheap: the rows it wants are one unbroken run of keys, so it's a single B-tree range walk from the key for 10 to the key for 20. Text keys are the text itself, so they get the same shortcut; `FLOAT` keys don't sort in number order as text, so they fall back to a full read.
 
-Rules the executor enforces: types must match the column (an `INT` is accepted in a `FLOAT` column), primary keys must be unique and not `NULL`, a multi-row `INSERT` is checked completely before any row is written, and comparing with `NULL` is never true (use `IS NULL`), as in standard SQL.
+Rules the executor enforces: types must match the column (an `INT` is accepted in a `FLOAT` column), primary keys must be unique and not `NULL`, a multi-row `INSERT` is checked completely before any row is written, and comparing with `NULL` is never true (use `IS NULL`), as in standard SQL. `AND`, `OR` and `NOT` use SQL's three-valued logic: `FALSE AND NULL` is `FALSE` but `TRUE AND NULL` is `NULL`, so `NOT (a > 1 AND b > 1)` never keeps a row just because `b` is missing.
 
 ## Commands
 
@@ -448,6 +499,7 @@ vaultdb/
   internal/sql/       SQL lexer, recursive descent parser, AST, executor, result tables
   internal/vector/    vectors, cosine/L2 distance, flat index, HNSW index, collections
   cmd/vaultdb-bench/  benchmark: exact vs HNSW speed and recall at several sizes, writes CSV
+  bench/sqlite/       benchmark: VaultDB vs SQLite on the same workloads (separate Go module)
   docs/               benchmark results and charts
   internal/ai/        AI providers: OpenAI-compatible, Gemini, Anthropic adapters and a local embedder
   internal/rag/       document chunking, incremental ingest, retrieval and grounded answers
@@ -530,7 +582,9 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 7. Vector search: store embeddings, nearest-neighbour queries (brute force, then HNSW), RAG chat with any AI provider
 - [x] 8a. Benchmarks, playground website
 - [x] 8b. Engine compiled to WebAssembly, site hosted on Vercel
-- [ ] 8c. Custom domain, v1.0 release
+- [x] 8c. v1.0 release: SQLite comparison, client tests, race-checked CI, three-valued `AND`/`OR`
+- [ ] 9. Custom domain for the playground
+- [ ] 10. Binary row format and a simple query planner, to close the SQL gap with SQLite
 
 ## Author
 

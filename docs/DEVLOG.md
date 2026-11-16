@@ -99,3 +99,16 @@ How it works:
 Tests: parser cases for precedence and errors, executor cases for ends, NULL rules, columns as ends, `HAVING`, `UPDATE`/`DELETE`, and a `TEXT` primary key next to a table with a similar name (so a range can't leak into the neighbouring table's keys). `TestBetweenMatchesComparisons` runs 300 random ranges, including the int64 extremes and reversed ends, against both an `INT` and a `TEXT` key and checks the shortcut gives the same rows as `>= AND <=` while never doing a full table read. I also checked it catches a real bug: dropping the `\x00` makes six tests fail.
 
 One thing I noticed while writing the NULL cases: plain `AND`/`OR` in `eval` treat NULL like FALSE (`l == true && r == true`), so `NOT (x > 1 AND y > 1)` with `y` NULL comes out TRUE when standard SQL says NULL. `BETWEEN` doesn't go through that path, so it's correct, but fixing `AND`/`OR` to proper three-valued logic is next.
+
+## 2026-11-16: v1.0.0
+
+VaultDB is now 1.0. This release was about proving the work rather than adding features: real tests where there were none, a comparison against a real database, and fixing the one wrong answer I already knew about.
+
+- **Three-valued `AND` and `OR`.** Last time I noted that `AND`/`OR` treated `NULL` like `FALSE`, so `NOT (x > 1 AND y > 1)` with `y` missing came out `TRUE` and `WHERE` kept a row it shouldn't. They now follow the SQL truth tables in one small `logic` function: the value that settles the answer on its own wins (`FALSE` for `AND`, `TRUE` for `OR`), otherwise any `NULL` makes the result `NULL`. Non-boolean operands are now an error instead of silently counting as `FALSE`. `TestLogicTruthTable` checks all 18 combinations, and `TestThreeValuedLogic` checks it through `WHERE`. I put the old code back temporarily to make sure both tests fail on it, and they do.
+- **Client tests.** `internal/client` had no tests of its own (the server tests used it, but nothing checked how it handles a bad server). A fake server now sends it replies with newlines inside, empty replies, broken headers, negative and oversized lengths, and bodies that are cut off, and 20 goroutines share one client to check every command gets its own reply. Coverage went from 0% to 100%.
+- **VaultDB vs SQLite.** `bench/sqlite` runs the same workloads on both, with real files, and reports the median of 3 runs. VaultDB wins every key-value test except reopening (7.7x faster point reads, 1.4x faster durable writes), because all keys live in memory and nothing goes through a C call. SQLite wins every SQL test, by 11 to 40x on scans and grouping, because VaultDB decodes a JSON row for every row it touches and has no planner. Both sides of that are in the README, along with what makes each number fair. It is a separate Go module, so the database itself still has zero dependencies.
+- **CI.** A GitHub Actions workflow runs `go vet` and the whole suite under the race detector on every push.
+
+Numbers at 1.0: about 8,100 lines of Go and 3,700 lines of tests, 127 tests plus a fuzz test, 89.7% coverage of `internal/`.
+
+Next: a binary row format and a simple query planner, to close the SQL gap with SQLite.
