@@ -105,3 +105,39 @@ func FuzzLikeMatch(f *testing.F) {
 		}
 	})
 }
+
+// TestLogicTruthTable checks AND and OR against SQL's three-valued truth
+// tables, every combination of TRUE, FALSE and NULL.
+func TestLogicTruthTable(t *testing.T) {
+	T, F := any(true), any(false)
+	var N any
+	cases := []struct {
+		l, r    any
+		and, or any
+	}{
+		{T, T, T, T}, {T, F, F, T}, {T, N, N, T},
+		{F, T, F, T}, {F, F, F, F}, {F, N, F, N},
+		{N, T, N, T}, {N, F, F, N}, {N, N, N, N},
+	}
+	for _, c := range cases {
+		for _, op := range []string{"AND", "OR"} {
+			want := c.and
+			if op == "OR" {
+				want = c.or
+			}
+			got, err := logic(op, c.l, c.r)
+			if err != nil {
+				t.Fatalf("%v %s %v: %v", c.l, op, c.r, err)
+			}
+			if got != want {
+				t.Errorf("%v %s %v = %v, want %v", c.l, op, c.r, got, want)
+			}
+		}
+	}
+	if _, err := logic("AND", int64(1), true); err == nil {
+		t.Error("1 AND TRUE should be a type error")
+	}
+	if _, err := logic("OR", false, "yes"); err == nil {
+		t.Error("FALSE OR 'yes' should be a type error")
+	}
+}

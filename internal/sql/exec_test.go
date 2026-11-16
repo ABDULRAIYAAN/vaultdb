@@ -808,3 +808,34 @@ func TestBetweenMatchesComparisons(t *testing.T) {
 		}
 	}
 }
+
+// TestThreeValuedLogic checks WHERE through NOT, where treating NULL as FALSE
+// gives wrong rows. The "Old" student has gpa NULL.
+func TestThreeValuedLogic(t *testing.T) {
+	e := setup(t)
+	cases := []struct {
+		q    string
+		want [][]any
+	}{
+		// Old has id -5: id > 0 is FALSE, FALSE AND NULL is FALSE, NOT keeps it.
+		{`SELECT name FROM students WHERE NOT (id > 0 AND gpa > 3)`, [][]any{{"Old"}}},
+		// id < 0 is TRUE for Old, TRUE AND NULL is NULL, and NOT NULL is NULL,
+		// so Old is not kept. Treating NULL as FALSE wrongly kept it here.
+		{`SELECT name FROM students WHERE NOT (id < 0 AND gpa > 3)`, [][]any{{"Ali"}, {"Sara"}, {"Raiyaan"}}},
+		// FALSE AND NULL is FALSE, so NOT makes it TRUE and Old is kept.
+		{`SELECT name FROM students WHERE NOT (id > 100 AND gpa > 3)`, [][]any{{"Old"}, {"Ali"}, {"Sara"}, {"Raiyaan"}}},
+		// TRUE OR NULL is TRUE.
+		{`SELECT name FROM students WHERE id < 0 OR gpa > 3.5`, [][]any{{"Old"}, {"Sara"}, {"Raiyaan"}}},
+		// FALSE OR NULL is NULL, and NOT NULL is NULL, so Old is never kept.
+		{`SELECT name FROM students WHERE NOT (id > 100 OR gpa > 3.5)`, [][]any{{"Ali"}}},
+	}
+	for _, c := range cases {
+		got := rows(t, e, c.q)
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s\n  got  %v\n  want %v", c.q, got, c.want)
+		}
+	}
+	if _, err := e.Exec(`SELECT name FROM students WHERE id AND active`); err == nil {
+		t.Error("an INT in AND should be an error")
+	}
+}

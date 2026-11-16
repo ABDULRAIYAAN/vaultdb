@@ -56,10 +56,8 @@ func eval(ex Expr, s *schema, row []any) (any, error) {
 			return nil, err
 		}
 		switch x.Op {
-		case "AND":
-			return l == true && r == true, nil
-		case "OR":
-			return l == true || r == true, nil
+		case "AND", "OR":
+			return logic(x.Op, l, r)
 		}
 		if l == nil || r == nil {
 			return nil, nil
@@ -120,6 +118,31 @@ func eval(ex Expr, s *schema, row []any) (any, error) {
 		return nil, fmt.Errorf("aggregate function %s can only be used in HAVING", x.Agg.Name())
 	}
 	return nil, fmt.Errorf("cannot evaluate %T", ex)
+}
+
+// logic joins two conditions with AND or OR using SQL's three-valued logic,
+// where NULL means "unknown":
+//
+//	AND: FALSE if either side is FALSE, else NULL if either is NULL, else TRUE
+//	OR:  TRUE if either side is TRUE, else NULL if either is NULL, else FALSE
+//
+// So "FALSE AND NULL" is FALSE (the answer is false whatever the unknown is),
+// but "TRUE AND NULL" is NULL. This matters under NOT: with y NULL,
+// NOT (x > 1 AND y > 1) must be NULL, not TRUE, or WHERE would keep the row.
+func logic(op string, l, r any) (any, error) {
+	for _, v := range []any{l, r} {
+		if _, ok := v.(bool); v != nil && !ok {
+			return nil, fmt.Errorf("%s needs TRUE or FALSE, got %s", op, typeName(v))
+		}
+	}
+	decides := op == "OR" // the value that settles the answer on its own
+	if l == decides || r == decides {
+		return decides, nil
+	}
+	if l == nil || r == nil {
+		return nil, nil
+	}
+	return !decides, nil
 }
 
 // evalIn works out "v IN (list)" once v is known. Each list value is compared
