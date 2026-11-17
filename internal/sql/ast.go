@@ -144,6 +144,11 @@ type Delete struct {
 	Where Expr
 }
 
+// Explain: EXPLAIN SELECT * FROM students WHERE id > 5. Instead of running
+// the statement, it shows how it would run: which rows it reads from the
+// store, and what it does with them after.
+type Explain struct{ Stmt Statement }
+
 func (CreateTable) stmt() {}
 func (DropTable) stmt()   {}
 func (ShowTables) stmt()  {}
@@ -151,6 +156,7 @@ func (Insert) stmt()      {}
 func (Select) stmt()      {}
 func (Update) stmt()      {}
 func (Delete) stmt()      {}
+func (Explain) stmt()     {}
 
 // Expr is anything that produces a value: a literal, a column, or a
 // comparison like age > 20 AND name = 'Ali'.

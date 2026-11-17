@@ -24,6 +24,7 @@ import (
 //	       (HAVING's expr may use aggs; other exprs may not)
 //	UPDATE t SET col = expr, ... [WHERE expr]
 //	DELETE FROM t [WHERE expr]
+//	EXPLAIN SELECT ... | EXPLAIN UPDATE ... | EXPLAIN DELETE ...
 //
 // Names are case-insensitive: Students and students are the same table.
 func Parse(query string) (Statement, error) {
@@ -124,7 +125,7 @@ func (p *parser) expectIdent(what string) (string, error) {
 func (p *parser) statement() (Statement, error) {
 	t := p.peek()
 	if t.Kind != TokKeyword {
-		return nil, p.errorf("a statement must start with SELECT, INSERT, UPDATE, DELETE, CREATE, DROP or SHOW, found %s", describe(t))
+		return nil, p.errorf("a statement must start with SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, SHOW or EXPLAIN, found %s", describe(t))
 	}
 	switch t.Text {
 	case "SELECT":
@@ -147,6 +148,13 @@ func (p *parser) statement() (Statement, error) {
 	case "SHOW":
 		p.next()
 		return ShowTables{}, p.expectKeyword("TABLES")
+	case "EXPLAIN":
+		p.next()
+		if t := p.peek(); t.Kind != TokKeyword || t.Text != "SELECT" && t.Text != "UPDATE" && t.Text != "DELETE" {
+			return nil, p.errorf("EXPLAIN works with SELECT, UPDATE and DELETE, found %s", describe(t))
+		}
+		st, err := p.statement()
+		return Explain{Stmt: st}, err
 	}
 	return nil, p.errorf("unknown statement %s", t.Text)
 }

@@ -12,9 +12,9 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 | | |
 |---|---|
-| Code | about 8,100 lines of Go, plus 4,000 lines of tests |
-| Tests | 133 tests and 2 fuzz tests, all passing under Go's race detector |
-| Test coverage | 89.9% of the database packages (`internal/`) |
+| Code | about 8,500 lines of Go, plus 4,300 lines of tests |
+| Tests | 138 tests and 2 fuzz tests, all passing under Go's race detector |
+| Test coverage | 90.5% of the database packages (`internal/`) |
 | Dependencies | none: only the Go standard library |
 | Key-value reads | 597 ns per lookup at 100,000 keys, 7.7x faster than SQLite, which in turn wins every SQL query test ([details](#vaultdb-vs-sqlite)) |
 | Durable writes | 161 µs per write with fsync, 1.4x faster than SQLite |
@@ -23,7 +23,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, a small query planner that turns primary key conditions into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -288,7 +288,7 @@ vaultdb> SELECT name, gpa FROM students WHERE gpa > 3.5 ORDER BY gpa DESC
 (2 rows)
 ```
 
-Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, `DISTINCT`, aggregates, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`. Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] IN (...)`, `[NOT] LIKE`, `[NOT] BETWEEN ... AND ...` and brackets.
+Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, `DISTINCT`, aggregates, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`, `EXPLAIN` (for `SELECT`, `UPDATE` and `DELETE`). Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] IN (...)`, `[NOT] LIKE`, `[NOT] BETWEEN ... AND ...` and brackets.
 
 ### IN and LIKE
 
@@ -434,6 +434,32 @@ vaultdb> SELECT COUNT(*), COUNT(DISTINCT dept) FROM students
 
 How it runs: each result row is turned into a map key (the JSON text of its values) and only rows whose key hasn't been seen are kept, so the order from `ORDER BY` is preserved. Aggregates keep a small set of the values they've already used and skip repeats.
 
+### EXPLAIN and the query planner
+
+`EXPLAIN` in front of a `SELECT`, `UPDATE` or `DELETE` shows how it would run, without running it:
+
+```
+vaultdb> EXPLAIN SELECT name FROM students WHERE id >= 100 AND id < 200 AND name LIKE 'A%' ORDER BY gpa DESC
+1. range scan of students by primary key: id >= 100 AND id < 200
+2. filter rows: id >= 100 AND id < 200 AND name LIKE 'A%'
+3. sort by gpa DESC
+vaultdb> EXPLAIN DELETE FROM students WHERE id IN (1, 2, 3) AND id > 1
+1. lookup students by primary key: id IN (2, 3) (2 keys)
+2. filter rows: id IN (1, 2, 3) AND id > 1
+3. delete each matching row
+vaultdb> EXPLAIN SELECT * FROM students WHERE id > 5 AND id < 5
+1. read nothing from students: no row can match the primary key condition
+```
+
+The first line is the planner's choice of which rows to read. It splits `WHERE` at its top-level `AND`s (each piece must be true on its own for a row to be kept) and looks for pieces about the primary key:
+
+- `id = 5` and `id IN (1, 5)` give exact keys, read with one lookup each.
+- `id > 5`, `id <= 9`, `5 < id` and `id BETWEEN 1 AND 9` give bounds, read with one B-tree range walk.
+- Several pieces are combined: the tightest lower and upper bounds win, and listed keys outside the bounds are dropped. A comparison with `NULL`, or bounds that cross, means no row can match, so nothing is read.
+- Anything else (`OR`, `NOT`, `!=`, other columns, `id > 2.5` on an `INT` key) doesn't narrow the read; it's only checked per row.
+
+Every row that is read is still checked against the whole `WHERE`, so the planner can only make a query faster, never change its answer. A randomised test runs 2,000 mixed conditions on `INT` and `TEXT` keys and compares every result with a full table read. On 20,000 rows, `WHERE id >= 5000 AND id < 5100 AND gpa > 2` went from 10 ms (a full read) to 75 µs.
+
 ### How SQL runs
 
 ```
@@ -454,7 +480,7 @@ sql:row:students:8000000000000001     "\x01\x03\x03\x02\x05\aRaiyaan\x04333333\x
 sql:row:students:8000000000000002     "\x01\x03\x03\x04\x05\x03Ali\x04\x9a\x99\x99\x99\x99\x99\t@"   (2, 'Ali', 3.2)
 ```
 
-Because the store is a B-tree, a table's rows sit next to each other, so a full table read is one prefix walk. `WHERE id = 2` on the primary key skips the walk and does a single key lookup, and `WHERE id IN (2, 5)` does one per value. Integer keys are written as 16 hex digits with the sign bit flipped, so key order matches number order, negatives included. That's what makes `WHERE id BETWEEN 10 AND 20` cheap: the rows it wants are one unbroken run of keys, so it's a single B-tree range walk from the key for 10 to the key for 20. Text keys are the text itself, so they get the same shortcut; `FLOAT` keys don't sort in number order as text, so they fall back to a full read.
+Because the store is a B-tree, a table's rows sit next to each other, so a full table read is one prefix walk. `WHERE id = 2` on the primary key skips the walk and does a single key lookup, and `WHERE id IN (2, 5)` does one per value. Integer keys are written as 16 hex digits with the sign bit flipped, so key order matches number order, negatives included. That's what makes `WHERE id BETWEEN 10 AND 20` or `WHERE id > 10 AND id <= 20` cheap: the rows it wants are one unbroken run of keys, so it's a single B-tree range walk from the key for 10 to the key for 20. Text keys are the text itself, so they get the same shortcut. Which of these the executor uses is decided by the planner; see [EXPLAIN and the query planner](#explain-and-the-query-planner).
 
 Rules the executor enforces: types must match the column (an `INT` is accepted in a `FLOAT` column), primary keys must be unique and not `NULL`, a multi-row `INSERT` is checked completely before any row is written, and comparing with `NULL` is never true (use `IS NULL`), as in standard SQL. `AND`, `OR` and `NOT` use SQL's three-valued logic: `FALSE AND NULL` is `FALSE` but `TRUE AND NULL` is `NULL`, so `NOT (a > 1 AND b > 1)` never keeps a row just because `b` is missing.
 
@@ -607,7 +633,8 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 8c. v1.0 release: SQLite comparison, client tests, race-checked CI, three-valued `AND`/`OR`
 - [ ] 9. Custom domain for the playground
 - [x] 10a. Binary row format: SQL scans 3 to 5x faster, old JSON rows still readable
-- [ ] 10b. A simple query planner, to close the rest of the SQL gap with SQLite
+- [x] 10b. A simple query planner: primary key conditions joined by `AND` become key lookups and range walks, `EXPLAIN` shows the plan
+- [ ] 10c. Secondary indexes, so the planner can use columns other than the primary key
 
 ## Author
 

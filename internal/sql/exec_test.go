@@ -759,7 +759,8 @@ func (s *scanCounter) Prefix(prefix string, limit int) ([]store.KV, bool) {
 }
 
 // The shortcut must give the same rows as the plain comparisons it stands
-// for, which always read the whole table. Random keys, including negatives
+// for, read the slow way: the planner doesn't look inside NOT, so
+// "NOT NOT (...)" always reads the whole table. Random keys, including negatives
 // and the int64 extremes, and random bounds either way round.
 func TestBetweenMatchesComparisons(t *testing.T) {
 	st := &scanCounter{Store: store.New()}
@@ -795,14 +796,14 @@ func TestBetweenMatchesComparisons(t *testing.T) {
 		if st.prefixReads != before {
 			t.Fatalf("id BETWEEN %d AND %d read the whole table", lo, hi)
 		}
-		want := rows(t, e, fmt.Sprintf(`SELECT id FROM n WHERE id >= %d AND id <= %d`, lo, hi))
+		want := rows(t, e, fmt.Sprintf(`SELECT id FROM n WHERE NOT NOT (id >= %d AND id <= %d)`, lo, hi))
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("id BETWEEN %d AND %d\n got %v\nwant %v", lo, hi, got, want)
 		}
 
 		a, b := word(), word()
 		got = rows(t, e, fmt.Sprintf(`SELECT k FROM s WHERE k BETWEEN '%s' AND '%s'`, a, b))
-		want = rows(t, e, fmt.Sprintf(`SELECT k FROM s WHERE k >= '%s' AND k <= '%s'`, a, b))
+		want = rows(t, e, fmt.Sprintf(`SELECT k FROM s WHERE NOT NOT (k >= '%s' AND k <= '%s')`, a, b))
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("k BETWEEN %q AND %q\n got %v\nwant %v", a, b, got, want)
 		}

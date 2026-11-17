@@ -133,3 +133,25 @@ Tests: round trips for every type including the int64 extremes, `-0.0`, `NaN`, i
 The SQLite comparison table in the README is still the v1.0.0 run; I'll re-run it with the C compiler setup before the next release.
 
 Next: a simple query planner, the other half of roadmap item 10.
+
+## 2026-11-17: A query planner and EXPLAIN
+
+The other half of roadmap item 10. Until now the executor had three hard-coded shortcuts, each matching one exact shape of `WHERE`: `pk = x`, `pk IN (...)` and `pk BETWEEN a AND b`. Anything else read the whole table, even `WHERE id >= 100 AND id < 200`, or `WHERE id = 5 AND active = TRUE`, where the primary key condition is right there. I replaced the shortcuts with a small planner in `internal/sql/plan.go`, and added `EXPLAIN` so you can see what it picked.
+
+Why: this is the most common way real queries miss the fast path. A range written with comparisons, or a key lookup with one extra filter, are both normal SQL, and both were paying for a full scan. It's also the base a secondary index will need later: something has to decide which rows to read before the executor reads them.
+
+How it works:
+
+- `planAccess` splits `WHERE` at its top-level `AND`s. `WHERE` only keeps rows where the whole thing is TRUE, and `a AND b` is only TRUE when both are, so each piece has to hold on its own and can narrow the read by itself. `OR` and `NOT` are left whole, since neither side of an `OR` has to hold.
+- Each piece about the primary key becomes exact keys (`=`, `IN`), a lower or upper bound (`>`, `>=`, `<`, `<=`, either way round, and `BETWEEN`), or "nothing can match" (any comparison with `NULL`). Then they're intersected: the tightest bound on each side, and only listed keys that fall inside the bounds. Bounds that cross, like `id > 5 AND id < 5`, read nothing at all.
+- Bounds are stored as keys with the open or closed end already worked in: `> v` starts at `key(v) + "\x00"` (the smallest key after it) and `<= v` ends there, so a tighter bound is just a bigger or smaller string. That only works because key order is value order, which was already true for `INT` and `TEXT` keys, the only types a primary key can have. With no lower or upper bound, the range is clamped to `sql:row:<table>:` up to `sql:row:<table>;` (`;` is the byte after `:`), so a range can never run into another table's rows.
+- Every row the plan reads is still checked against the full `WHERE`. So the planner only needs to be safe, never exact: reading too much costs time, skipping a row would be a bug. Anything it can't turn into keys exactly (`id > 2.5` on an `INT` key, `id = 'one'`) is just left to that check.
+- `EXPLAIN SELECT/UPDATE/DELETE` checks the table and every column name, then prints numbered steps: how rows are read, the filter, then grouping, `HAVING`, sorting, `DISTINCT`, `LIMIT`. It never runs the statement. To print the filter I wrote `exprString`, which turns an expression tree back into SQL with brackets wherever `AND` meets `OR`. It returns plain text lines rather than a result table, because a table would put every step in quotes like a `TEXT` value.
+
+Tests: a table of 30-odd plans with their `EXPLAIN` lines; `TestPlannerMatchesFullScan`, which runs 2,000 random `AND` chains (mixed `=`, `<`, `>=`, `!=`, `IN`, `BETWEEN`, `NULL`, literal-first comparisons, `OR`s and non-key columns) on an `INT` table and a `TEXT` table with similarly named neighbours, and checks each against the same query wrapped in `NOT NOT (...)`, which the planner can't see into and so always reads everything; checks that planned `UPDATE` and `DELETE` never read the whole table; and a round trip that every printed expression parses back into the same tree. I also broke the planner four ways on purpose (no `\x00` on an open lower bound, not flipping `5 < id`, not dropping keys outside the bounds, a sloppy table prefix) and each one fails at least one test. The old `BETWEEN` test was comparing against `>= AND <=`, which now goes through the planner too, so it now uses `NOT NOT` as well.
+
+Numbers: on 20,000 rows, `WHERE id >= 5000 AND id < 5100 AND gpa > 2` went from 10.1 ms to about 75 µs, the same as the `BETWEEN` version. New benchmark: `BenchmarkPKComparisonRange100`.
+
+One thing to note: because fewer rows are read, a type error in another part of `WHERE` (say `name > 5`) now only shows up if one of the rows the plan reads hits it. That was already true for `pk = x`, and it's how row-by-row checks work anywhere, but the real fix is checking types before running, which I'd like to do at some point.
+
+Next: secondary indexes (`CREATE INDEX`), so the planner can use columns other than the primary key.

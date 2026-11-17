@@ -121,6 +121,7 @@ func TestExecuteLineRoutesSQL(t *testing.T) {
 		{`INSERT INTO t VALUES (1, 'Ali')`, "OK, 1 row inserted"},
 		{`SELECT name FROM t`, "+-------+\n| name  |\n+-------+\n| 'Ali' |\n+-------+\n(1 row)"},
 		{`SELECT * FROM missing`, "(error) table missing does not exist"},
+		{`explain SELECT name FROM t WHERE id = 1`, "1. lookup t by primary key: id = 1 (1 key)\n2. filter rows: id = 1"},
 		{`SET plain value`, "OK"},
 		{`GET plain`, `"value"`},
 		{`   `, ""},

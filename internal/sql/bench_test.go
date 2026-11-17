@@ -75,3 +75,9 @@ func BenchmarkDecodeRow(b *testing.B) {
 		}
 	}
 }
+
+// The same 100 rows as BenchmarkPKRange100, but asked for with comparisons
+// and an extra condition, which the planner turns into the same range walk.
+func BenchmarkPKComparisonRange100(b *testing.B) {
+	benchQuery(b, benchTable(b, 20_000), `SELECT name, gpa FROM students WHERE id >= 5000 AND id < 5100 AND gpa > 2`)
+}

@@ -114,6 +114,8 @@ func (e *Executor) Exec(query string) (Result, error) {
 		return e.update(s)
 	case Delete:
 		return e.deleteRows(s)
+	case Explain:
+		return e.explain(s.Stmt)
 	}
 	return Result{}, fmt.Errorf("unsupported statement %T", st)
 }
@@ -294,23 +296,23 @@ type storedRow struct {
 	vals []any
 }
 
-// matchingRows returns every row of the table that passes where. If where is
-// "primary key = value" or "primary key IN (values)", it fetches just those
-// rows directly with a GET each instead of reading the whole table. If it is
-// "primary key BETWEEN a AND b", it reads only that slice of the B-tree.
+// matchingRows returns every row of the table that passes where. It reads
+// only the rows the planner says could pass (see plan.go): a GET per key for
+// "pk = 5" or "pk IN (...)", one B-tree range walk for bounds like
+// "pk > 5 AND pk <= 9", and the whole table otherwise. Every row it reads is
+// then checked against all of where.
 func (e *Executor) matchingRows(table string, s *schema, where Expr) ([]storedRow, error) {
 	var candidates []store.KV
-	if keys, ok := pkLookup(table, s, where); ok {
-		for _, key := range keys {
+	switch a := planAccess(table, s, where); a.kind {
+	case keyLookup:
+		for _, key := range a.keys {
 			if raw, err := e.st.Get(key); err == nil {
 				candidates = append(candidates, store.KV{Key: key, Value: raw})
 			}
 		}
-	} else if from, to, ok := pkRange(table, s, where); ok {
-		if from < to {
-			candidates, _ = e.st.Scan(from, to, 0)
-		}
-	} else {
+	case rangeScan:
+		candidates, _ = e.st.Scan(a.from, a.to, 0)
+	case fullScan:
 		candidates, _ = e.st.Prefix(rowPrefix+table+":", 0)
 	}
 
@@ -332,107 +334,6 @@ func (e *Executor) matchingRows(table string, s *schema, where Expr) ([]storedRo
 		out = append(out, storedRow{kv.Key, vals})
 	}
 	return out, nil
-}
-
-// pkLookup recognises "WHERE pk = literal" (either way round) and
-// "WHERE pk IN (literal, ...)", and returns the row keys to fetch, sorted and
-// without repeats so rows come back in the same order as a full table read.
-// Anything it can't turn into a key exactly (a value of the wrong type, say)
-// makes it give up, and the caller falls back to reading every row, so the
-// answer, or the error, is always the same as without the shortcut.
-func pkLookup(table string, s *schema, where Expr) ([]string, bool) {
-	pk := s.pk()
-	if pk < 0 {
-		return nil, false
-	}
-	isPK := func(ex Expr) bool {
-		ref, ok := ex.(ColumnRef)
-		return ok && ref.Name == s.Columns[pk].Name
-	}
-	var lits []Expr
-	switch x := where.(type) {
-	case Binary:
-		if x.Op != "=" {
-			return nil, false
-		}
-		c, l := x.Left, x.Right
-		if _, isLit := c.(Literal); isLit {
-			c, l = l, c
-		}
-		if !isPK(c) {
-			return nil, false
-		}
-		lits = []Expr{l}
-	case In:
-		if x.Negate || !isPK(x.Expr) {
-			return nil, false
-		}
-		lits = x.List
-	default:
-		return nil, false
-	}
-
-	var keys []string
-	seen := map[string]bool{}
-	for _, ex := range lits {
-		lit, ok := ex.(Literal)
-		if !ok {
-			return nil, false
-		}
-		if lit.Value == nil {
-			continue // pk = NULL never matches, and a pk is never NULL anyway
-		}
-		v, err := coerce(lit.Value, s.Columns[pk])
-		if err != nil {
-			return nil, false
-		}
-		if k := rowKey(table, v); !seen[k] {
-			seen[k] = true
-			keys = append(keys, k)
-		}
-	}
-	sort.Strings(keys)
-	return keys, true
-}
-
-// pkRange recognises "WHERE pk BETWEEN literal AND literal" and returns the
-// slice of row keys [from, to) that holds exactly the matching rows. That
-// only works when key order is the same as value order: true for INT keys
-// (written as fixed-width hex with the sign bit flipped) and for TEXT keys
-// (the text itself, and TEXT compares byte by byte). FLOAT keys are written
-// with %v, whose order isn't number order, so those, like anything else it
-// can't turn into keys exactly, fall back to reading the whole table.
-//
-// The upper end is inclusive, so to is the high key plus a zero byte: the
-// smallest string that sorts after it. A NULL end means no row can match,
-// which the caller sees as from >= to.
-func pkRange(table string, s *schema, where Expr) (from, to string, ok bool) {
-	b, isBetween := where.(Between)
-	pk := s.pk()
-	if !isBetween || b.Negate || pk < 0 {
-		return "", "", false
-	}
-	col := s.Columns[pk]
-	if col.Type != TypeInt && col.Type != TypeText {
-		return "", "", false
-	}
-	if ref, isRef := b.Expr.(ColumnRef); !isRef || ref.Name != col.Name {
-		return "", "", false
-	}
-	low, okLow := b.Low.(Literal)
-	high, okHigh := b.High.(Literal)
-	if !okLow || !okHigh {
-		return "", "", false
-	}
-	if low.Value == nil || high.Value == nil {
-		return "", "", true // a pk is never NULL, so nothing matches
-	}
-	lv, err1 := coerce(low.Value, col)
-	hv, err2 := coerce(high.Value, col)
-	if err1 != nil || err2 != nil {
-		return "", "", false
-	}
-	return rowKey(table, lv), rowKey(table, hv) + "\x00", true
 }
 
 func (e *Executor) selectRows(sel Select) (Result, error) {

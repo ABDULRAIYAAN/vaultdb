@@ -51,6 +51,7 @@ SQL (tables are stored as keys under sql:):
   SELECT DISTINCT active FROM students  |  SELECT COUNT(DISTINCT gpa) FROM students
   UPDATE students SET gpa = 4.0 WHERE id = 1
   DELETE FROM students WHERE id = 2
+  EXPLAIN SELECT * FROM students WHERE id > 1 AND gpa > 3   (how it runs, without running it)
   SHOW TABLES  |  DROP TABLE students`
 
 // Engine executes commands.
@@ -67,7 +68,7 @@ func New(s *store.Store) *Engine {
 
 var sqlStarts = map[string]bool{
 	"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true,
-	"CREATE": true, "DROP": true, "SHOW": true,
+	"CREATE": true, "DROP": true, "SHOW": true, "EXPLAIN": true,
 }
 
 // ExecuteLine runs one line typed by the user. Lines that start with a SQL
