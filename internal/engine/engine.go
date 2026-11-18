@@ -52,7 +52,8 @@ SQL (tables are stored as keys under sql:):
   UPDATE students SET gpa = 4.0 WHERE id = 1
   DELETE FROM students WHERE id = 2
   EXPLAIN SELECT * FROM students WHERE id > 1 AND gpa > 3   (how it runs, without running it)
-  SHOW TABLES  |  DROP TABLE students`
+  CREATE INDEX by_gpa ON students (gpa)   (WHERE on gpa no longer reads the whole table)
+  SHOW TABLES  |  DROP TABLE students  |  SHOW INDEXES  |  DROP INDEX by_gpa`
 
 // Engine executes commands.
 type Engine struct {

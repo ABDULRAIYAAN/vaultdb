@@ -16,6 +16,7 @@ import (
 //	CREATE TABLE t (col TYPE [PRIMARY KEY], ...)        TYPE: INT FLOAT TEXT BOOL
 //	DROP TABLE t
 //	SHOW TABLES
+//	CREATE INDEX name ON t (col)  |  DROP INDEX name  |  SHOW INDEXES
 //	INSERT INTO t [(col, ...)] VALUES (expr, ...), ...
 //	SELECT * | item, ... FROM t [WHERE expr] [GROUP BY col, ...]
 //	       [HAVING expr] [ORDER BY col|agg [ASC|DESC]] [LIMIT n]
@@ -140,14 +141,24 @@ func (p *parser) statement() (Statement, error) {
 		return p.createStmt()
 	case "DROP":
 		p.next()
+		if p.acceptWord("INDEX") {
+			name, err := p.expectIdent("index")
+			return DropIndex{Name: name}, err
+		}
 		if err := p.expectKeyword("TABLE"); err != nil {
-			return nil, err
+			return nil, p.errorf("expected TABLE or INDEX, found %s", describe(p.peek()))
 		}
 		name, err := p.expectIdent("table")
 		return DropTable{Table: name}, err
 	case "SHOW":
 		p.next()
-		return ShowTables{}, p.expectKeyword("TABLES")
+		if p.acceptWord("INDEXES") {
+			return ShowIndexes{}, nil
+		}
+		if !p.acceptKeyword("TABLES") {
+			return nil, p.errorf("expected TABLES or INDEXES, found %s", describe(p.peek()))
+		}
+		return ShowTables{}, nil
 	case "EXPLAIN":
 		p.next()
 		if t := p.peek(); t.Kind != TokKeyword || t.Text != "SELECT" && t.Text != "UPDATE" && t.Text != "DELETE" {
@@ -159,10 +170,51 @@ func (p *parser) statement() (Statement, error) {
 	return nil, p.errorf("unknown statement %s", t.Text)
 }
 
+// acceptWord skips the next token if it is the identifier w, in any case.
+// INDEX, INDEXES and ON are words like this rather than keywords: they only
+// mean something right where this looks for them, so a column that is
+// already called "index" or "on" keeps working everywhere else.
+func (p *parser) acceptWord(w string) bool {
+	t := p.peek()
+	if t.Kind == TokIdent && strings.EqualFold(t.Text, w) {
+		p.next()
+		return true
+	}
+	return false
+}
+
+// createIndex reads the rest of CREATE INDEX name ON t (col).
+func (p *parser) createIndex() (Statement, error) {
+	name, err := p.expectIdent("index")
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptWord("ON") {
+		return nil, p.errorf("expected ON, found %s", describe(p.peek()))
+	}
+	st := CreateIndex{Name: name}
+	if st.Table, err = p.expectIdent("table"); err != nil {
+		return nil, err
+	}
+	if err := p.expectSymbol("("); err != nil {
+		return nil, err
+	}
+	if st.Column, err = p.expectIdent("column"); err != nil {
+		return nil, err
+	}
+	if p.peek().Kind == TokSymbol && p.peek().Text == "," {
+		return nil, p.errorf("an index covers one column; create one index per column")
+	}
+	return st, p.expectSymbol(")")
+}
+
 func (p *parser) createStmt() (Statement, error) {
 	p.next() // CREATE
-	if err := p.expectKeyword("TABLE"); err != nil {
-		return nil, err
+	if p.acceptWord("INDEX") {
+		return p.createIndex()
+	}
+	if !p.acceptKeyword("TABLE") {
+		return nil, p.errorf("expected TABLE or INDEX, found %s", describe(p.peek()))
 	}
 	name, err := p.expectIdent("table")
 	if err != nil {

@@ -21,6 +21,7 @@ import (
 //	sql:schema:students        -> {"columns":[{"name":"id","type":"INT","pk":true}, ...]}
 //	sql:seq:students           -> last automatic row id (tables without a primary key)
 //	sql:row:students:<key>     -> one row, values in column order (binary, see row.go)
+//	sql:idx:students:<index>:<value><end><key> -> the row's key (see index.go)
 //
 // Because the store is a B-tree, all rows of a table sit next to each other
 // (they share the prefix "sql:row:students:"), so reading a whole table is
@@ -70,7 +71,8 @@ type column struct {
 }
 
 type schema struct {
-	Columns []column `json:"columns"`
+	Columns []column   `json:"columns"`
+	Indexes []indexDef `json:"indexes,omitempty"`
 }
 
 func (s *schema) index(name string) int {
@@ -106,6 +108,12 @@ func (e *Executor) Exec(query string) (Result, error) {
 		return e.drop(s)
 	case ShowTables:
 		return e.showTables()
+	case CreateIndex:
+		return e.createIndex(s)
+	case DropIndex:
+		return e.dropIndex(s)
+	case ShowIndexes:
+		return e.showIndexes()
 	case Insert:
 		return e.insert(s)
 	case Select:
@@ -169,6 +177,12 @@ func (e *Executor) drop(d DropTable) (Result, error) {
 	}
 	rows, _ := e.st.Prefix(rowPrefix+d.Table+":", 0)
 	for _, kv := range rows {
+		if _, err := e.st.Delete(kv.Key); err != nil {
+			return Result{}, err
+		}
+	}
+	entries, _ := e.st.Prefix(indexPrefix+d.Table+":", 0)
+	for _, kv := range entries {
 		if _, err := e.st.Delete(kv.Key); err != nil {
 			return Result{}, err
 		}
@@ -276,6 +290,9 @@ func (e *Executor) insert(ins Insert) (Result, error) {
 			}
 			key = rowKey(ins.Table, id)
 		}
+		if err := e.addIndexEntries(ins.Table, s, key, row); err != nil {
+			return Result{}, err
+		}
 		if err := e.writeRow(key, row); err != nil {
 			return Result{}, err
 		}
@@ -299,20 +316,24 @@ type storedRow struct {
 // matchingRows returns every row of the table that passes where. It reads
 // only the rows the planner says could pass (see plan.go): a GET per key for
 // "pk = 5" or "pk IN (...)", one B-tree range walk for bounds like
-// "pk > 5 AND pk <= 9", and the whole table otherwise. Every row it reads is
-// then checked against all of where.
+// "pk > 5 AND pk <= 9", a walk over an index's entries for conditions on an
+// indexed column, and the whole table otherwise. Every row it reads is then
+// checked against all of where.
 func (e *Executor) matchingRows(table string, s *schema, where Expr) ([]storedRow, error) {
 	var candidates []store.KV
-	switch a := planAccess(table, s, where); a.kind {
-	case keyLookup:
+	a := planAccess(table, s, where)
+	switch {
+	case a.index != "":
+		candidates = e.indexRows(a)
+	case a.kind == keyLookup:
 		for _, key := range a.keys {
 			if raw, err := e.st.Get(key); err == nil {
 				candidates = append(candidates, store.KV{Key: key, Value: raw})
 			}
 		}
-	case rangeScan:
+	case a.kind == rangeScan:
 		candidates, _ = e.st.Scan(a.from, a.to, 0)
-	case fullScan:
+	case a.kind == fullScan:
 		candidates, _ = e.st.Prefix(rowPrefix+table+":", 0)
 	}
 
@@ -847,7 +868,20 @@ func (e *Executor) update(u Update) (Result, error) {
 		updated[n] = newVals
 	}
 	for n, r := range rows {
+		// New index entries before the row, old ones after it (see index.go).
+		oldEntries := indexEntries(u.Table, s, r.key, r.vals)
+		newEntries := indexEntries(u.Table, s, r.key, updated[n])
+		for _, k := range newEntries {
+			if !contains(oldEntries, k) {
+				if err := e.st.Set(k, r.key); err != nil {
+					return Result{}, err
+				}
+			}
+		}
 		if err := e.writeRow(r.key, updated[n]); err != nil {
+			return Result{}, err
+		}
+		if err := e.removeIndexEntries(u.Table, s, r.key, r.vals, newEntries); err != nil {
 			return Result{}, err
 		}
 	}
@@ -868,6 +902,9 @@ func (e *Executor) deleteRows(d Delete) (Result, error) {
 	}
 	for _, r := range rows {
 		if _, err := e.st.Delete(r.key); err != nil {
+			return Result{}, err
+		}
+		if err := e.removeIndexEntries(d.Table, s, r.key, r.vals, nil); err != nil {
 			return Result{}, err
 		}
 	}

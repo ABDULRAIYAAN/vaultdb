@@ -36,6 +36,17 @@ import (
 // exactly, like "id > 2.5" on an INT key or a value of the wrong type, is
 // left to the per-row check, so it still gives the right answer or error.
 //
+// Indexes (see index.go) work the same way: an index is just another sorted
+// run of keys, one per row, ordered by the indexed column's value. So the
+// planner looks at the conditions once for the primary key and once for each
+// index, and picks the best result: reading nothing beats exact values,
+// exact values beat a range, and a range beats reading the whole table. On a
+// tie the primary key wins, since it reaches a row in one GET where an index
+// needs a walk over its entries first, and between indexes the older one
+// wins. That's a simple rule with no statistics behind it, so it can pick
+// "dept = 'eng'" over a narrower "year > 2024", but it never picks a plan
+// that's worse than reading everything.
+//
 // EXPLAIN shows the plan without running the statement.
 
 type accessKind int
@@ -50,12 +61,49 @@ const (
 // access is how a statement reaches its rows.
 type access struct {
 	kind     accessKind
-	keys     []string // keyLookup: sorted, no repeats
-	vals     []any    // keyLookup: the primary key values, same order as keys
+	keys     []string // keyLookup: the first key for each value, sorted, no repeats
+	ends     []string // keyLookup: the first key past each value's keys
+	vals     []any    // keyLookup: the values, same order as keys
 	low      *bound   // rangeScan: nil means no lower bound
 	high     *bound   // rangeScan: nil means no upper bound
 	from, to string   // rangeScan: the key range, from included, to not
-	pk       string   // name of the primary key column
+	col      string   // the column the plan is about
+	index    string   // the index the keys belong to, or "" for the primary key
+}
+
+// keySpace says how one column's values turn into store keys, so the same
+// planner works for the primary key, whose values are the row keys, and for
+// an index, whose values are at the front of its entries.
+type keySpace struct {
+	col      column
+	index    string             // "" for the primary key
+	start    func(v any) string // the first key that can belong to v
+	after    func(v any) string // the first key past every key of v
+	from, to string             // every key in the space is in [from, to)
+}
+
+func pkSpace(table string, col column) keySpace {
+	// Every row key of the table starts with "sql:row:<table>:", and ';'
+	// is the byte after ':', so from and to hold exactly the table's rows.
+	return keySpace{
+		col:   col,
+		start: func(v any) string { return rowKey(table, v) },
+		after: func(v any) string { return rowKey(table, v) + "\x00" }, // the smallest key that sorts after v's
+		from:  rowPrefix + table + ":",
+		to:    rowPrefix + table + ";",
+	}
+}
+
+func indexSpace(table string, ix indexDef, col column) keySpace {
+	from, to := indexKeys(table, ix.Name)
+	return keySpace{
+		col:   col,
+		index: ix.Name,
+		start: func(v any) string { return indexValueStart(table, ix.Name, v) },
+		after: func(v any) string { return indexValueAfter(table, ix.Name, v) },
+		from:  from,
+		to:    to,
+	}
 }
 
 // bound is one end of a key range. key is where the range starts (for a
@@ -68,9 +116,9 @@ type bound struct {
 	key  string
 }
 
-// planner collects what each AND-ed condition says about the primary key.
+// planner collects what each AND-ed condition says about one column.
 type planner struct {
-	table string
+	ks    keySpace
 	col   column
 	keyed bool  // some condition listed exact keys
 	vals  []any // the values allowed so far, if keyed
@@ -82,12 +130,30 @@ type planner struct {
 // planAccess works out which rows of table a statement with this WHERE has
 // to read.
 func planAccess(table string, s *schema, where Expr) access {
-	pk := s.pk()
-	if pk < 0 || where == nil {
-		return access{kind: fullScan}
+	best := access{kind: fullScan}
+	if where == nil {
+		return best
 	}
-	p := &planner{table: table, col: s.Columns[pk]}
-	for _, c := range conjuncts(where, nil) {
+	conds := conjuncts(where, nil)
+	if pk := s.pk(); pk >= 0 {
+		best = planSpace(pkSpace(table, s.Columns[pk]), conds)
+	}
+	for _, ix := range s.Indexes {
+		col := s.Columns[s.index(ix.Column)]
+		if a := planSpace(indexSpace(table, ix, col), conds); rank[a.kind] > rank[best.kind] {
+			best = a
+		}
+	}
+	return best
+}
+
+// rank orders plans from worst to best.
+var rank = map[accessKind]int{fullScan: 0, rangeScan: 1, keyLookup: 2, noRows: 3}
+
+// planSpace works out what conds allow in one key space.
+func planSpace(ks keySpace, conds []Expr) access {
+	p := &planner{ks: ks, col: ks.col}
+	for _, c := range conds {
 		p.add(c)
 	}
 	return p.finish()
@@ -106,7 +172,7 @@ func conjuncts(ex Expr, out []Expr) []Expr {
 // 5 < id is id > 5.
 var flipped = map[string]string{"=": "=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
 
-func (p *planner) isPK(ex Expr) bool {
+func (p *planner) isCol(ex Expr) bool {
 	ref, ok := ex.(ColumnRef)
 	return ok && ref.Name == p.col.Name
 }
@@ -122,11 +188,11 @@ func (p *planner) add(ex Expr) {
 			c, l, op = l, c, flipped[x.Op]
 		}
 		lit, isLit := l.(Literal)
-		if !p.isPK(c) || !isLit {
+		if !p.isCol(c) || !isLit {
 			return
 		}
 		if lit.Value == nil {
-			p.none = true // pk compared with NULL is never TRUE
+			p.none = true // a comparison with NULL is never TRUE
 			return
 		}
 		v, err := coerce(lit.Value, p.col)
@@ -146,7 +212,7 @@ func (p *planner) add(ex Expr) {
 			p.upper(v, true)
 		}
 	case In:
-		if x.Negate || !p.isPK(x.Expr) {
+		if x.Negate || !p.isCol(x.Expr) {
 			return
 		}
 		var vals []any
@@ -156,7 +222,7 @@ func (p *planner) add(ex Expr) {
 				return
 			}
 			if lit.Value == nil {
-				continue // pk = NULL never matches, and a pk is never NULL anyway
+				continue // col = NULL never matches
 			}
 			v, err := coerce(lit.Value, p.col)
 			if err != nil {
@@ -166,7 +232,7 @@ func (p *planner) add(ex Expr) {
 		}
 		p.allow(vals)
 	case Between:
-		if x.Negate || !p.isPK(x.Expr) {
+		if x.Negate || !p.isCol(x.Expr) {
 			return
 		}
 		low, okLow := x.Low.(Literal)
@@ -201,7 +267,7 @@ func (p *planner) allow(vals []any) {
 	var both []any
 	for _, v := range vals {
 		for _, w := range p.vals {
-			if rowKey(p.table, v) == rowKey(p.table, w) {
+			if p.ks.start(v) == p.ks.start(w) {
 				both = append(both, v)
 				break
 			}
@@ -210,20 +276,22 @@ func (p *planner) allow(vals []any) {
 	p.vals = both
 }
 
+// lower: > v starts past all of v's keys, >= v at the first of them.
 func (p *planner) lower(v any, incl bool) {
-	b := &bound{val: v, incl: incl, key: rowKey(p.table, v)}
-	if !incl {
-		b.key += "\x00" // the smallest key that sorts after v's
+	b := &bound{val: v, incl: incl, key: p.ks.after(v)}
+	if incl {
+		b.key = p.ks.start(v)
 	}
 	if p.low == nil || b.key > p.low.key {
 		p.low = b
 	}
 }
 
+// upper: < v stops before v's first key, <= v just past its last.
 func (p *planner) upper(v any, incl bool) {
-	b := &bound{val: v, incl: incl, key: rowKey(p.table, v)}
+	b := &bound{val: v, incl: incl, key: p.ks.start(v)}
 	if incl {
-		b.key += "\x00"
+		b.key = p.ks.after(v)
 	}
 	if p.high == nil || b.key < p.high.key {
 		p.high = b
@@ -231,10 +299,8 @@ func (p *planner) upper(v any, incl bool) {
 }
 
 func (p *planner) finish() access {
-	a := access{low: p.low, high: p.high, pk: p.col.Name}
-	// Every row key of the table starts with "sql:row:<table>:", and ';'
-	// is the byte after ':', so these two hold exactly the table's rows.
-	a.from, a.to = rowPrefix+p.table+":", rowPrefix+p.table+";"
+	a := access{low: p.low, high: p.high, col: p.col.Name, index: p.ks.index}
+	a.from, a.to = p.ks.from, p.ks.to
 	if p.low != nil {
 		a.from = p.low.key
 	}
@@ -248,16 +314,17 @@ func (p *planner) finish() access {
 		a.kind = keyLookup
 		seen := map[string]bool{}
 		for _, v := range p.vals {
-			k := rowKey(p.table, v)
+			k := p.ks.start(v)
 			if k < a.from || k >= a.to || seen[k] {
 				continue
 			}
 			seen[k] = true
 			a.keys = append(a.keys, k)
+			a.ends = append(a.ends, p.ks.after(v))
 			a.vals = append(a.vals, v)
 		}
 		// Sorted, so rows come back in the same order as a full table read.
-		sort.Sort(byKey{a.keys, a.vals})
+		sort.Sort(byKey{a.keys, a.ends, a.vals})
 		if len(a.keys) == 0 {
 			a.kind = noRows
 		}
@@ -272,21 +339,26 @@ func (p *planner) finish() access {
 	return a
 }
 
-// byKey sorts keys and their values together.
+// byKey sorts keys and the ends and values that go with them together.
 type byKey struct {
-	keys []string
-	vals []any
+	keys, ends []string
+	vals       []any
 }
 
 func (b byKey) Len() int           { return len(b.keys) }
 func (b byKey) Less(i, j int) bool { return b.keys[i] < b.keys[j] }
 func (b byKey) Swap(i, j int) {
 	b.keys[i], b.keys[j] = b.keys[j], b.keys[i]
+	b.ends[i], b.ends[j] = b.ends[j], b.ends[i]
 	b.vals[i], b.vals[j] = b.vals[j], b.vals[i]
 }
 
 // describe is the plan's first EXPLAIN line.
 func (a access) describe(table string) string {
+	by, unit := "primary key", "key"
+	if a.index != "" {
+		by, unit = "index "+a.index, "value"
+	}
 	switch a.kind {
 	case keyLookup:
 		parts := make([]string, len(a.vals))
@@ -294,9 +366,9 @@ func (a access) describe(table string) string {
 			parts[i] = Format(v)
 		}
 		if len(parts) == 1 {
-			return fmt.Sprintf("lookup %s by primary key: %s = %s (1 key)", table, a.pk, parts[0])
+			return fmt.Sprintf("lookup %s by %s: %s = %s (1 %s)", table, by, a.col, parts[0], unit)
 		}
-		return fmt.Sprintf("lookup %s by primary key: %s IN (%s) (%d keys)", table, a.pk, strings.Join(parts, ", "), len(parts))
+		return fmt.Sprintf("lookup %s by %s: %s IN (%s) (%d %ss)", table, by, a.col, strings.Join(parts, ", "), len(parts), unit)
 	case rangeScan:
 		var parts []string
 		if a.low != nil {
@@ -304,17 +376,20 @@ func (a access) describe(table string) string {
 			if a.low.incl {
 				op = ">="
 			}
-			parts = append(parts, fmt.Sprintf("%s %s %s", a.pk, op, Format(a.low.val)))
+			parts = append(parts, fmt.Sprintf("%s %s %s", a.col, op, Format(a.low.val)))
 		}
 		if a.high != nil {
 			op := "<"
 			if a.high.incl {
 				op = "<="
 			}
-			parts = append(parts, fmt.Sprintf("%s %s %s", a.pk, op, Format(a.high.val)))
+			parts = append(parts, fmt.Sprintf("%s %s %s", a.col, op, Format(a.high.val)))
 		}
-		return fmt.Sprintf("range scan of %s by primary key: %s", table, strings.Join(parts, " AND "))
+		return fmt.Sprintf("range scan of %s by %s: %s", table, by, strings.Join(parts, " AND "))
 	case noRows:
+		if a.index != "" {
+			return fmt.Sprintf("read nothing from %s: no row can match the condition on %s", table, a.col)
+		}
 		return fmt.Sprintf("read nothing from %s: no row can match the primary key condition", table)
 	}
 	return "full scan of " + table

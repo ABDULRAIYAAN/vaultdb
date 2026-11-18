@@ -12,9 +12,9 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 | | |
 |---|---|
-| Code | about 8,500 lines of Go, plus 4,300 lines of tests |
-| Tests | 138 tests and 2 fuzz tests, all passing under Go's race detector |
-| Test coverage | 90.5% of the database packages (`internal/`) |
+| Code | about 9,000 lines of Go, plus 4,850 lines of tests |
+| Tests | 146 tests and 2 fuzz tests, all passing under Go's race detector |
+| Test coverage | 90.8% of the database packages (`internal/`) |
 | Dependencies | none: only the Go standard library |
 | Key-value reads | 597 ns per lookup at 100,000 keys, 7.7x faster than SQLite, which in turn wins every SQL query test ([details](#vaultdb-vs-sqlite)) |
 | Durable writes | 161 µs per write with fsync, 1.4x faster than SQLite |
@@ -23,7 +23,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, a small query planner that turns primary key conditions into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -288,7 +288,7 @@ vaultdb> SELECT name, gpa FROM students WHERE gpa > 3.5 ORDER BY gpa DESC
 (2 rows)
 ```
 
-Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, `DISTINCT`, aggregates, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`, `EXPLAIN` (for `SELECT`, `UPDATE` and `DELETE`). Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] IN (...)`, `[NOT] LIKE`, `[NOT] BETWEEN ... AND ...` and brackets.
+Supported: `CREATE TABLE`, `DROP TABLE`, `SHOW TABLES`, `CREATE INDEX`, `DROP INDEX`, `SHOW INDEXES`, `INSERT` (several rows at once, optional column list), `SELECT` (columns, `*`, `DISTINCT`, aggregates, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY ... ASC|DESC`, `LIMIT`), `UPDATE ... SET ... WHERE`, `DELETE ... WHERE`, `EXPLAIN` (for `SELECT`, `UPDATE` and `DELETE`). Types: `INT`, `FLOAT`, `TEXT`, `BOOL`, plus `NULL`. Conditions: `= != <> < <= > >=`, `AND`, `OR`, `NOT`, `IS [NOT] NULL`, `[NOT] IN (...)`, `[NOT] LIKE`, `[NOT] BETWEEN ... AND ...` and brackets.
 
 ### IN and LIKE
 
@@ -451,7 +451,7 @@ vaultdb> EXPLAIN SELECT * FROM students WHERE id > 5 AND id < 5
 1. read nothing from students: no row can match the primary key condition
 ```
 
-The first line is the planner's choice of which rows to read. It splits `WHERE` at its top-level `AND`s (each piece must be true on its own for a row to be kept) and looks for pieces about the primary key:
+The first line is the planner's choice of which rows to read. It splits `WHERE` at its top-level `AND`s (each piece must be true on its own for a row to be kept) and looks for pieces about the primary key (and, the same way, about each [indexed column](#secondary-indexes)):
 
 - `id = 5` and `id IN (1, 5)` give exact keys, read with one lookup each.
 - `id > 5`, `id <= 9`, `5 < id` and `id BETWEEN 1 AND 9` give bounds, read with one B-tree range walk.
@@ -459,6 +459,40 @@ The first line is the planner's choice of which rows to read. It splits `WHERE` 
 - Anything else (`OR`, `NOT`, `!=`, other columns, `id > 2.5` on an `INT` key) doesn't narrow the read; it's only checked per row.
 
 Every row that is read is still checked against the whole `WHERE`, so the planner can only make a query faster, never change its answer. A randomised test runs 2,000 mixed conditions on `INT` and `TEXT` keys and compares every result with a full table read. On 20,000 rows, `WHERE id >= 5000 AND id < 5100 AND gpa > 2` went from 10 ms (a full read) to 75 µs.
+
+### Secondary indexes
+
+The primary key is the only column the store can look up directly. `CREATE INDEX` gives another column the same shortcut:
+
+```
+vaultdb> CREATE INDEX by_gpa ON students (gpa)
+OK, index by_gpa created on students (gpa) with 3 entries
+vaultdb> EXPLAIN SELECT name FROM students WHERE gpa >= 3.5 AND name LIKE 'S%'
+1. range scan of students by index by_gpa: gpa >= 3.5
+2. filter rows: gpa >= 3.5 AND name LIKE 'S%'
+vaultdb> SHOW INDEXES
++------------+----------+--------+
+| table      | index    | column |
++------------+----------+--------+
+| 'students' | 'by_gpa' | 'gpa'  |
++------------+----------+--------+
+(1 row)
+vaultdb> DROP INDEX by_gpa
+OK, index by_gpa dropped
+```
+
+An index is one extra key per row, holding the column's value followed by the row's key, and pointing at the row:
+
+```
+sql:idx:students:by_gpa:<3.6><end><id 3>   ->  sql:row:students:<id 3>
+sql:idx:students:by_gpa:<3.9><end><id 1>   ->  sql:row:students:<id 1>
+```
+
+Values are encoded so that key order is value order (`INT` like a primary key, `FLOAT` by its IEEE 754 bits with the usual sign trick, `TEXT` as its bytes with `0x00` escaped so the `<end>` marker can't appear inside a value), so `gpa = 3.9` is one short range walk and `gpa >= 3.5` one longer one, followed by a lookup per row. The planner treats each index like the primary key and picks the best plan: reading nothing, then exact values, then a range, then a full read, with the primary key winning ties. `NULL`s aren't indexed, since no comparison with `NULL` is ever true.
+
+`INSERT`, `UPDATE` and `DELETE` keep indexes in step, ordered so that a crash halfway can only leave an extra entry behind, never lose one (new entry before the row, old entry removed after it). An extra entry is harmless because every row read is checked against the whole `WHERE` anyway. A test cuts each statement off after every possible write and checks that no row ever goes missing from a query. Indexes are one column each, and their names are unique across all tables. `INDEX` and `ON` aren't reserved words, so a column already called `index` keeps working.
+
+On 20,000 rows, `WHERE name = 'student12345'` takes 7.5 ms without an index and 10 µs with one. The price is on the write side: an `INSERT` into a table with two indexes takes 13 µs instead of 9 µs.
 
 ### How SQL runs
 
@@ -634,7 +668,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [ ] 9. Custom domain for the playground
 - [x] 10a. Binary row format: SQL scans 3 to 5x faster, old JSON rows still readable
 - [x] 10b. A simple query planner: primary key conditions joined by `AND` become key lookups and range walks, `EXPLAIN` shows the plan
-- [ ] 10c. Secondary indexes, so the planner can use columns other than the primary key
+- [x] 10c. Secondary indexes (`CREATE INDEX`), so the planner can use columns other than the primary key
 
 ## Author
 

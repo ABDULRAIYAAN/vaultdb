@@ -38,6 +38,19 @@ type DropTable struct{ Table string }
 // ShowTables: SHOW TABLES
 type ShowTables struct{}
 
+// CreateIndex: CREATE INDEX by_dept ON staff (dept). A secondary index keeps
+// a sorted list of (value, row) pairs for one column, so the planner can find
+// the rows with dept = 'eng' without reading the whole table.
+type CreateIndex struct {
+	Name, Table, Column string
+}
+
+// DropIndex: DROP INDEX by_dept. Index names are unique across all tables.
+type DropIndex struct{ Name string }
+
+// ShowIndexes: SHOW INDEXES
+type ShowIndexes struct{}
+
 // Insert: INSERT INTO students (id, name) VALUES (1, 'Ali'), (2, 'Sara')
 type Insert struct {
 	Table   string
@@ -152,6 +165,9 @@ type Explain struct{ Stmt Statement }
 func (CreateTable) stmt() {}
 func (DropTable) stmt()   {}
 func (ShowTables) stmt()  {}
+func (CreateIndex) stmt() {}
+func (DropIndex) stmt()   {}
+func (ShowIndexes) stmt() {}
 func (Insert) stmt()      {}
 func (Select) stmt()      {}
 func (Update) stmt()      {}
