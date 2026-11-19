@@ -177,3 +177,23 @@ Tests: parser cases; a lifecycle test that runs lookups, ranges and grouping thr
 Numbers (20,000 rows, in memory): `WHERE name = 'student12345'` 7.5 ms without an index, 10 µs with one. 100 rows by `gpa = 3.45` takes about 80 µs and 500 rows by `gpa >= 3.95` about 440 µs. The cost is on writes: an `INSERT` with two indexes is 13 µs instead of 9 µs.
 
 Not done yet: indexes over more than one column, `IS NULL` through an index, and `ORDER BY` reading straight from an index instead of sorting. The playground site still runs the WebAssembly build from before, so it doesn't have `CREATE INDEX` until I rebuild it.
+
+## 2026-11-19: Expiring keys
+
+The key-value side can now forget things on a timer: `EXPIRE key seconds`, `PEXPIRE key ms`, `TTL`/`PTTL` to see what's left (`-1` for no expiry, `-2` for no key, like Redis), and `PERSIST` to take the expiry off again. `INFO` shows how many keys have one. The store code is in `internal/store/ttl.go`.
+
+Why: sessions, caches, rate-limit counters and one-time codes are what people actually put in a key-value store, and every one of them needs to disappear by itself. Without it you'd need a cron job deleting keys, and nothing stops a read from seeing a stale value in between.
+
+How it works:
+
+- The log has a new record type, `EXPIRE` (op 4). Its value is the **deadline** in Unix milliseconds, not "60 seconds", and an empty value means `PERSIST`. Saving the absolute time is what makes it survive a restart properly: if the database is down for 20 seconds, a key with a minute left comes back with 40 seconds, not a fresh minute, and a key whose time ran out while it was closed is dropped as it opens. The format version stays at 2, since old logs never contain op 4; a version 1 log that somehow does is treated as damaged.
+- The store keeps a `map[key]deadline` next to the B-tree. From the deadline on, every read skips the key: `GET`, `EXISTS`, `KEYS`, `SCAN`/`PREFIX` (whose limit only counts live keys) and `COUNT`. So it's gone at exactly that millisecond as far as anyone can tell.
+- Actually freeing the memory is lazy, the way Redis does it, because reads only hold the read lock and can't change anything. An expired key is removed when a write touches it, after every write (which checks up to 20 keys with a deadline, and since Go starts every map walk at a random spot, they all get checked over time), at compaction and at startup. None of that writes a `DEL` record. The log already says when the key runs out, so replaying it always gets the same answer.
+- The reaping after a write happens *after* the change is applied, not before. Otherwise an `EXPIRE` could check the key is alive, then the reaper drops it a millisecond later, and the `EXPIRE` record lands in the log for a key memory no longer has, which would bring it back to life on restart.
+- A plain `SET` clears the deadline (Redis does the same), `EXPIRE` with zero or a negative number deletes straight away, and anything under a millisecond rounds up to one. `TTL` rounds up too, so a key that is still there never shows `0`.
+- Compaction writes a `SET` and then an `EXPIRE` for each key with a deadline, and `liveBytes` counts both, so the garbage percentage in `INFO` stays right.
+- Keys under `sql:` and `vec:` can't be given an expiry, same as `SET` and `DEL`. A row disappearing on its own would leave its index entries pointing at nothing.
+
+Tests: the deadline boundary to the millisecond across every read path; `Scan`'s limit not being used up by expired keys; `SET` and `PERSIST` clearing deadlines; writes reaping 500 untouched expired keys and `liveBytes` coming back to exactly one key's worth; a restart test where the database is closed for 20 seconds; and `TestExpiryMatchesModel`, which runs 4,000 random `SET`/`DEL`/`EXPIRE`/`PERSIST` steps, clock jumps, compactions and restarts against a plain map with a fake clock, and checks after every compaction that the log is exactly as big as `liveBytes` predicted. I broke it nine ways on purpose (no reaping at startup, `SET` not clearing the deadline, compaction dropping deadlines, not subtracting the `EXPIRE` record from `liveBytes`, `<` instead of `<=` at the deadline, `SCAN` and `PREFIX` not skipping expired keys, no reaping after writes, rounding short durations down) and each one fails at least one test.
+
+Not done yet: `SET key value EX seconds` in one command. Doing it as two log records would let a crash in between leave the key with no expiry, so it wants a combined record, which I'll do separately. The playground still runs the old WebAssembly build, so it doesn't have these commands until I rebuild it.

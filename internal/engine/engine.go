@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ABDULRAIYAAN/vaultdb/internal/parser"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/sql"
@@ -21,6 +22,10 @@ const HelpText = `Commands:
   GET <key>           read a value
   DEL <key>           delete a key
   EXISTS <key>        1 if the key exists, 0 if not
+  EXPIRE <key> <seconds>     delete the key after this many seconds
+  PEXPIRE <key> <ms>         the same, in milliseconds
+  TTL <key>  |  PTTL <key>   time left in seconds / ms (-1: no expiry, -2: no key)
+  PERSIST <key>              remove the expiry, keep the key
   KEYS                list every key, sorted
   SCAN <from> <to> [limit]   keys from <from> up to (not incl.) <to>;
                              use "" for no start or no end
@@ -106,9 +111,13 @@ func managed(key string) bool {
 	return false
 }
 
+// writesKey lists the commands that change one key, named by their first
+// argument.
+var writesKey = map[string]bool{"SET": true, "DEL": true, "EXPIRE": true, "PEXPIRE": true, "PERSIST": true}
+
 // Execute runs cmd and returns the text to show the user.
 func (e *Engine) Execute(cmd parser.Command) string {
-	if (cmd.Name == "SET" || cmd.Name == "DEL") && len(cmd.Args) > 0 && managed(cmd.Args[0]) {
+	if writesKey[cmd.Name] && len(cmd.Args) > 0 && managed(cmd.Args[0]) {
 		return "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
 	}
 	if strings.HasPrefix(cmd.Name, "V") {
@@ -157,6 +166,56 @@ func (e *Engine) Execute(cmd parser.Command) string {
 			return "(integer) 1"
 		}
 		return "(integer) 0"
+
+	case "EXPIRE", "PEXPIRE":
+		unit, name := time.Second, "seconds"
+		if cmd.Name == "PEXPIRE" {
+			unit, name = time.Millisecond, "milliseconds"
+		}
+		if len(cmd.Args) != 2 {
+			return usage(cmd.Name + " <key> <" + name + ">")
+		}
+		n, err := strconv.ParseInt(cmd.Args[1], 10, 64)
+		if err != nil {
+			return "(error) " + name + " must be a whole number"
+		}
+		if n > int64(store.MaxTTL/unit) {
+			return "(error) " + store.ErrTTLTooLong.Error()
+		}
+		if n < 0 {
+			n = 0 // also deletes; avoids overflow for huge negative numbers
+		}
+		ok, err := e.store.Expire(cmd.Args[0], time.Duration(n)*unit)
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return boolInt(ok)
+
+	case "TTL", "PTTL":
+		if len(cmd.Args) != 1 {
+			return usage(cmd.Name + " <key>")
+		}
+		left, has, err := e.store.TTL(cmd.Args[0])
+		switch {
+		case err != nil:
+			return "(integer) -2"
+		case !has:
+			return "(integer) -1"
+		case cmd.Name == "PTTL":
+			return fmt.Sprintf("(integer) %d", left.Milliseconds())
+		}
+		// Rounded up, so a key that is still there never shows 0 seconds.
+		return fmt.Sprintf("(integer) %d", (left+time.Second-1)/time.Second)
+
+	case "PERSIST":
+		if len(cmd.Args) != 1 {
+			return usage("PERSIST <key>")
+		}
+		ok, err := e.store.Persist(cmd.Args[0])
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return boolInt(ok)
 
 	case "KEYS":
 		if len(cmd.Args) != 0 {
@@ -216,8 +275,12 @@ func (e *Engine) Execute(cmd parser.Command) string {
 			return usage("INFO")
 		}
 		st := e.store.Stats()
+		expiring := ""
+		if st.Expiring > 0 {
+			expiring = fmt.Sprintf("\nkeys with an expiry: %d", st.Expiring)
+		}
 		if !st.Persistent {
-			return fmt.Sprintf("mode: in-memory (nothing saved)\nkeys: %d", st.Keys)
+			return fmt.Sprintf("mode: in-memory (nothing saved)\nkeys: %d", st.Keys) + expiring
 		}
 		garbage := 0.0
 		if st.LogBytes > 0 {
@@ -227,8 +290,8 @@ func (e *Engine) Execute(cmd parser.Command) string {
 		if !st.AutoCompact {
 			auto = "off"
 		}
-		out := fmt.Sprintf("mode: persistent (append-only log)\nkeys: %d\nlog size: %s\nlive data: %s\ngarbage: %.0f%%\nauto-compaction: %s\ncompactions this session: %d",
-			st.Keys, formatBytes(st.LogBytes), formatBytes(st.LiveBytes), garbage, auto, st.Compactions)
+		out := fmt.Sprintf("mode: persistent (append-only log)\nkeys: %d%s\nlog size: %s\nlive data: %s\ngarbage: %.0f%%\nauto-compaction: %s\ncompactions this session: %d",
+			st.Keys, expiring, formatBytes(st.LogBytes), formatBytes(st.LiveBytes), garbage, auto, st.Compactions)
 		if st.LastCompactErr != nil {
 			out += "\nlast compaction error: " + st.LastCompactErr.Error()
 		}
@@ -429,6 +492,13 @@ func formatBytes(n int64) string {
 	default:
 		return fmt.Sprintf("%d bytes", n)
 	}
+}
+
+func boolInt(b bool) string {
+	if b {
+		return "(integer) 1"
+	}
+	return "(integer) 0"
 }
 
 func usage(u string) string {

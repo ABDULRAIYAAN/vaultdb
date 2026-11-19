@@ -52,7 +52,8 @@ func readV1Record(r *bufio.Reader, hdr []byte) (Record, int64, error) {
 	op := Op(hdr[0])
 	keyLen := binary.BigEndian.Uint32(hdr[1:5])
 	valLen := binary.BigEndian.Uint32(hdr[5:9])
-	if !op.valid() || keyLen > MaxFieldSize || valLen > MaxFieldSize {
+	// Version 1 only ever had SET, DEL and CLEAR.
+	if op < OpSet || op > OpClear || keyLen > MaxFieldSize || valLen > MaxFieldSize {
 		return Record{}, 0, fmt.Errorf("invalid record header")
 	}
 	body := make([]byte, int(keyLen)+int(valLen))

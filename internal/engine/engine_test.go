@@ -3,6 +3,7 @@ package engine
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ABDULRAIYAAN/vaultdb/internal/parser"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/store"
@@ -159,6 +160,57 @@ func TestVectorCommands(t *testing.T) {
 	for _, s := range steps {
 		if got := e.ExecuteLine(s.in); got != s.want {
 			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
+	}
+}
+
+func TestExpiryCommands(t *testing.T) {
+	e := New(store.New())
+	steps := []struct{ in, want string }{
+		{`SET session abc`, "OK"},
+		{`TTL session`, "(integer) -1"},
+		{`TTL missing`, "(integer) -2"},
+		{`PTTL missing`, "(integer) -2"},
+		{`EXPIRE session 100`, "(integer) 1"},
+		{`TTL session`, "(integer) 100"},
+		{`INFO`, "mode: in-memory (nothing saved)\nkeys: 1\nkeys with an expiry: 1"},
+		{`EXPIRE missing 100`, "(integer) 0"},
+		{`PERSIST session`, "(integer) 1"},
+		{`PERSIST session`, "(integer) 0"},
+		{`TTL session`, "(integer) -1"},
+		{`PEXPIRE session 90000`, "(integer) 1"},
+		{`TTL session`, "(integer) 90"},
+		{`SET session new`, "OK"},
+		{`TTL session`, "(integer) -1"},
+		{`EXPIRE session 0`, "(integer) 1"},
+		{`GET session`, "(nil)"},
+		{`SET k v`, "OK"},
+		{`EXPIRE k -5`, "(integer) 1"},
+		{`EXISTS k`, "(integer) 0"},
+		{`EXPIRE k`, "(error) usage: EXPIRE <key> <seconds>"},
+		{`PEXPIRE k`, "(error) usage: PEXPIRE <key> <milliseconds>"},
+		{`TTL`, "(error) usage: TTL <key>"},
+		{`PERSIST`, "(error) usage: PERSIST <key>"},
+		{`EXPIRE k soon`, "(error) seconds must be a whole number"},
+		{`EXPIRE k 99999999999`, "(error) time to live is too long (the limit is 100 years)"},
+		{`EXPIRE sql:schema:t 10`, "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"},
+		{`PERSIST vec:x`, "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"},
+	}
+	for _, s := range steps {
+		if got := run(t, e, s.in); got != s.want {
+			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
+	}
+
+	// With the real clock: a key given 1 ms is gone a little later.
+	run(t, e, `SET blink x`)
+	if got := run(t, e, `PEXPIRE blink 1`); got != "(integer) 1" {
+		t.Fatalf("PEXPIRE blink 1 = %s", got)
+	}
+	time.Sleep(20 * time.Millisecond)
+	for in, want := range map[string]string{`GET blink`: "(nil)", `TTL blink`: "(integer) -2", `KEYS`: "(empty)"} {
+		if got := run(t, e, in); got != want {
+			t.Errorf("%s after expiry = %s, want %s", in, got, want)
 		}
 	}
 }

@@ -13,12 +13,18 @@
 // A sync.RWMutex guards everything: many readers at once, one writer at a
 // time. Holding the write lock across "append to log, then update map" also
 // keeps the log and the map in the same order.
+//
+// Keys can also be given a time to live (see ttl.go): once its deadline
+// passes, a key reads as missing everywhere, and the memory it used is freed
+// a little later.
 package store
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ABDULRAIYAAN/vaultdb/internal/aol"
 	"github.com/ABDULRAIYAAN/vaultdb/internal/btree"
@@ -45,6 +51,8 @@ type Options struct {
 	// CompactMinBytes and more than half of it is garbage.
 	AutoCompact     bool
 	CompactMinBytes int64
+	// Now is the clock that decides when keys expire. nil means time.Now.
+	Now func() time.Time
 }
 
 // DefaultOptions is safe, self-maintaining behaviour.
@@ -65,11 +73,22 @@ type Store struct {
 	liveBytes      int64
 	compactions    int
 	lastCompactErr error
+
+	// expires holds the deadline, in Unix milliseconds, of every key that
+	// has one. A key past its deadline may still be in data for a while;
+	// every read checks expires first, so it is never seen.
+	expires map[string]int64
+	now     func() time.Time // the clock; tests swap in a fake one
 }
 
 // New creates an empty in-memory Store. Nothing is saved to disk.
 func New() *Store {
-	return &Store{data: btree.New(btree.DefaultDegree), liveBytes: int64(aol.FileHeaderSize)}
+	return &Store{
+		data:      btree.New(btree.DefaultDegree),
+		liveBytes: int64(aol.FileHeaderSize),
+		expires:   map[string]int64{},
+		now:       time.Now,
+	}
 }
 
 // OpenInfo describes what Open loaded from disk.
@@ -96,12 +115,18 @@ func Open(path string, opts Options) (*Store, OpenInfo, error) {
 	s := New()
 	s.log = l
 	s.opts = opts
+	if opts.Now != nil {
+		s.now = opts.Now
+	}
 
 	res, err := l.Replay(s.apply, aol.ReplayOptions{Repair: opts.Repair})
 	if err != nil {
 		l.Close()
 		return nil, OpenInfo{}, err
 	}
+	// Keys whose deadline passed while the database was closed are still
+	// in the log, followed by their EXPIRE record. Drop them now.
+	s.reapAllLocked()
 	info := OpenInfo{
 		Path:          path,
 		Records:       res.Records,
@@ -124,22 +149,57 @@ func Open(path string, opts Options) (*Store, OpenInfo, error) {
 
 // apply changes the map for one record and keeps liveBytes in step. The
 // caller holds the lock (or, during replay, nobody else can see the store).
+//
+// liveBytes counts what compaction would write: one SET per key, plus one
+// EXPIRE for each key with a deadline.
 func (s *Store) apply(r aol.Record) {
 	switch r.Op {
 	case aol.OpSet:
+		// A plain SET replaces the value and any deadline, like in Redis.
+		s.clearDeadline(r.Key)
 		if old, ok := s.data.Get(r.Key); ok {
 			s.liveBytes -= aol.RecordSize(r.Key, old)
 		}
 		s.data.Set(r.Key, r.Value)
 		s.liveBytes += aol.RecordSize(r.Key, r.Value)
 	case aol.OpDelete:
-		if old, ok := s.data.Get(r.Key); ok {
-			s.liveBytes -= aol.RecordSize(r.Key, old)
-			s.data.Delete(r.Key)
-		}
+		s.drop(r.Key)
 	case aol.OpClear:
 		s.data.Clear()
+		s.expires = map[string]int64{}
 		s.liveBytes = int64(aol.FileHeaderSize)
+	case aol.OpExpire:
+		if _, ok := s.data.Get(r.Key); !ok {
+			return // nothing to expire; a log written by this store never does this
+		}
+		s.clearDeadline(r.Key)
+		if r.Value == "" {
+			return // PERSIST
+		}
+		at, err := strconv.ParseInt(r.Value, 10, 64)
+		if err != nil {
+			return // checksummed, so only a buggy writer could get here
+		}
+		s.expires[r.Key] = at
+		s.liveBytes += aol.RecordSize(r.Key, r.Value)
+	}
+}
+
+// drop removes key and its deadline from memory, keeping liveBytes in step.
+// It writes nothing to the log.
+func (s *Store) drop(key string) {
+	s.clearDeadline(key)
+	if old, ok := s.data.Get(key); ok {
+		s.liveBytes -= aol.RecordSize(key, old)
+		s.data.Delete(key)
+	}
+}
+
+// clearDeadline forgets key's deadline, if it has one.
+func (s *Store) clearDeadline(key string) {
+	if at, ok := s.expires[key]; ok {
+		s.liveBytes -= aol.RecordSize(key, deadlineString(at))
+		delete(s.expires, key)
 	}
 }
 
@@ -152,6 +212,10 @@ func (s *Store) write(r aol.Record) error {
 		}
 	}
 	s.apply(r)
+	// After apply, not before: the caller has already checked that the key
+	// it writes is live, and reaping first could drop it in between, so an
+	// EXPIRE would land in the log but not in memory.
+	s.reapSomeLocked()
 	if s.shouldAutoCompact() {
 		// The write itself already succeeded and is safely on disk, so a
 		// failed compaction is reported through INFO rather than as an error.
@@ -191,10 +255,15 @@ func (s *Store) Compact() (CompactResult, error) {
 func (s *Store) compactLocked() error {
 	// The B-tree hands keys over in sorted order, so compacted files are
 	// always identical for identical data.
+	// Expired keys are dropped first, so the new log doesn't carry them.
+	s.reapAllLocked()
 	err := s.log.Rewrite(func(emit func(aol.Record) error) error {
 		var emitErr error
 		s.data.Ascend("", "", func(k, v string) bool {
 			emitErr = emit(aol.Record{Op: aol.OpSet, Key: k, Value: v})
+			if at, ok := s.expires[k]; ok && emitErr == nil {
+				emitErr = emit(aol.Record{Op: aol.OpExpire, Key: k, Value: deadlineString(at)})
+			}
 			return emitErr == nil
 		})
 		return emitErr
@@ -220,7 +289,7 @@ func (s *Store) Get(key string) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v, ok := s.data.Get(key)
-	if !ok {
+	if !ok || s.expired(key, s.nowMs()) {
 		return "", ErrNotFound
 	}
 	return v, nil
@@ -231,7 +300,7 @@ func (s *Store) Get(key string) (string, error) {
 func (s *Store) Delete(key string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.data.Get(key); !ok {
+	if !s.liveLocked(key) {
 		return false, nil
 	}
 	if err := s.write(aol.Record{Op: aol.OpDelete, Key: key}); err != nil {
@@ -245,7 +314,7 @@ func (s *Store) Exists(key string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	_, ok := s.data.Get(key)
-	return ok
+	return ok && !s.expired(key, s.nowMs())
 }
 
 // Keys returns every key in sorted order.
@@ -253,8 +322,11 @@ func (s *Store) Keys() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	keys := make([]string, 0, s.data.Len())
+	now := s.nowMs()
 	s.data.Ascend("", "", func(k, _ string) bool {
-		keys = append(keys, k)
+		if !s.expired(k, now) {
+			keys = append(keys, k)
+		}
 		return true
 	})
 	return keys
@@ -272,7 +344,11 @@ type KV struct {
 func (s *Store) Scan(from, to string, limit int) (pairs []KV, more bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	now := s.nowMs()
 	s.data.Ascend(from, to, func(k, v string) bool {
+		if s.expired(k, now) {
+			return true
+		}
 		if limit > 0 && len(pairs) == limit {
 			more = true
 			return false
@@ -289,9 +365,13 @@ func (s *Store) Scan(from, to string, limit int) (pairs []KV, more bool) {
 func (s *Store) Prefix(prefix string, limit int) (pairs []KV, more bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	now := s.nowMs()
 	s.data.Ascend(prefix, "", func(k, v string) bool {
 		if !strings.HasPrefix(k, prefix) {
 			return false
+		}
+		if s.expired(k, now) {
+			return true
 		}
 		if limit > 0 && len(pairs) == limit {
 			more = true
@@ -307,7 +387,7 @@ func (s *Store) Prefix(prefix string, limit int) (pairs []KV, more bool) {
 func (s *Store) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.data.Len()
+	return s.data.Len() - s.expiredCount(s.nowMs())
 }
 
 // Clear removes every key.
@@ -321,6 +401,7 @@ func (s *Store) Clear() error {
 type Stats struct {
 	Persistent     bool
 	Keys           int
+	Expiring       int   // keys that have a deadline
 	LogBytes       int64 // size of the log file
 	LiveBytes      int64 // size of the current data (what a compacted log would weigh)
 	Compactions    int   // compactions since the store was opened
@@ -332,9 +413,11 @@ type Stats struct {
 func (s *Store) Stats() Stats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	expired := s.expiredCount(s.nowMs())
 	st := Stats{
 		Persistent:     s.log != nil,
-		Keys:           s.data.Len(),
+		Keys:           s.data.Len() - expired,
+		Expiring:       len(s.expires) - expired,
 		Compactions:    s.compactions,
 		AutoCompact:    s.opts.AutoCompact,
 		LastCompactErr: s.lastCompactErr,

@@ -58,6 +58,8 @@ func TestRoundTrip(t *testing.T) {
 		set("bio", "CS student, Taylor's"),
 		set("empty", ""),
 		set("unicode", "سلام 你好"),
+		{Op: OpExpire, Key: "bio", Value: "1700000000000"},
+		{Op: OpExpire, Key: "bio"}, // PERSIST
 		{Op: OpDelete, Key: "name"},
 		{Op: OpClear},
 	}
@@ -230,6 +232,21 @@ func TestLegacyLogIsReadThenRewritten(t *testing.T) {
 	defer l2.Close()
 	if res.Legacy || len(got) != 2 {
 		t.Fatalf("after migration: result %+v, records %v", res, got)
+	}
+}
+
+// EXPIRE came after format version 1, so an old file holding op 4 is
+// damaged, not a deadline.
+func TestLegacyLogHasNoExpire(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.log")
+	writeV1(t, path, set("name", "raiyaan"), Record{Op: OpExpire, Key: "name", Value: "1"})
+	l, err := Open(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if _, err := l.Replay(func(Record) {}, ReplayOptions{}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Replay = %v, want ErrCorrupt", err)
 	}
 }
 

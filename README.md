@@ -12,9 +12,9 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 | | |
 |---|---|
-| Code | about 9,000 lines of Go, plus 4,850 lines of tests |
-| Tests | 146 tests and 2 fuzz tests, all passing under Go's race detector |
-| Test coverage | 90.8% of the database packages (`internal/`) |
+| Code | about 9,500 lines of Go, plus 5,250 lines of tests |
+| Tests | 154 tests and 2 fuzz tests, all passing under Go's race detector |
+| Test coverage | 91.1% of the database packages (`internal/`) |
 | Dependencies | none: only the Go standard library |
 | Key-value reads | 597 ns per lookup at 100,000 keys, 7.7x faster than SQLite, which in turn wins every SQL query test ([details](#vaultdb-vs-sqlite)) |
 | Durable writes | 161 µs per write with fsync, 1.4x faster than SQLite |
@@ -23,7 +23,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`EXPIRE`, `TTL`, `PERSIST`) whose deadlines survive restarts, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -548,12 +548,16 @@ The decoder checks everything it reads (value count, each tag against the column
 | `GET <key>` | Read a value, or `(nil)` if missing |
 | `DEL <key>` | Delete a key. Returns 1 if it existed, 0 if not |
 | `EXISTS <key>` | 1 if the key exists, 0 if not |
+| `EXPIRE <key> <seconds>` | Delete the key after this many seconds. 1 if the key exists, 0 if not. Zero or less deletes it now |
+| `PEXPIRE <key> <ms>` | The same, in milliseconds |
+| `TTL <key>` / `PTTL <key>` | Seconds (rounded up) / milliseconds left. -1 if the key never expires, -2 if it doesn't exist |
+| `PERSIST <key>` | Remove the expiry so the key stays. 1 if there was one to remove |
 | `KEYS` | List every key, sorted |
 | `SCAN <from> <to> [limit]` | Keys from `<from>` up to (not including) `<to>`, sorted. `""` means no start or no end |
 | `PREFIX <prefix> [limit]` | Keys starting with `<prefix>`, sorted |
 | `COUNT` | Number of keys |
 | `CLEAR` | Delete everything |
-| `INFO` | Keys, log size, live data size, garbage percentage, compactions |
+| `INFO` | Keys, keys with an expiry, log size, live data size, garbage percentage, compactions |
 | `COMPACT` | Rewrite the log with only the current data |
 | `HELP` | Show the command list |
 | `EXIT` | Quit |
@@ -608,7 +612,8 @@ The file starts with a 9-byte header (`VAULTDB\0` plus a format version byte), f
 +------------+--------+------------+------------+-------------+-----+-------+
 | hdrCRC (4) | op (1) | keyLen (4) | valLen (4) | bodyCRC (4) | key | value |
 +------------+--------+------------+------------+-------------+-----+-------+
- op: 1 = SET, 2 = DEL, 3 = CLEAR          all integers big-endian
+ op: 1 = SET, 2 = DEL, 3 = CLEAR,        all integers big-endian
+     4 = EXPIRE (value: deadline in Unix ms, empty = PERSIST)
  hdrCRC  = CRC-32C of op, keyLen, valLen, bodyCRC
  bodyCRC = CRC-32C of key and value
 ```
@@ -616,6 +621,25 @@ The file starts with a 9-byte header (`VAULTDB\0` plus a format version byte), f
 Length prefixes (instead of, say, one line of text per record) mean keys and values can contain any bytes, including spaces, newlines and quotes, without escaping.
 
 **Why two checksums?** With a single checksum over the whole record, a flipped bit in a length field would make the reader trust a wrong length before it could check anything. It could then read past the real end of the record, decide the file was cut off, and throw away every valid record after it. Verifying the small fixed-size header first means a length is only used once it is known to be correct.
+
+### How expiring keys work
+
+```
+vaultdb> SET session abc
+OK
+vaultdb> EXPIRE session 60
+(integer) 1
+vaultdb> TTL session
+(integer) 60
+vaultdb> SET session xyz
+OK
+vaultdb> TTL session
+(integer) -1
+```
+
+`EXPIRE` writes one `EXPIRE` record to the log, right after the key's `SET`, holding the **absolute deadline** in Unix milliseconds rather than "60 seconds". So a restart doesn't hand the key a fresh minute: replay rebuilds the key and its deadline, and keys that ran out while the database was closed are dropped as it opens. A plain `SET` replaces the value and clears the deadline, like in Redis.
+
+Removing an expired key from memory is **lazy**, like Redis. From the deadline on, every read (`GET`, `EXISTS`, `KEYS`, `SCAN`, `PREFIX`, `COUNT`) skips the key, so it is gone as far as anyone can tell. The memory is freed when a write touches that key, after every write (which checks up to 20 keys that have a deadline and drops the expired ones), at compaction (which also leaves them out of the new log) and on startup. None of these write a `DEL`: the log already says when the key runs out, so replaying it always comes to the same answer, as long as the clock doesn't go backwards between runs. Keys under `sql:` and `vec:` can't be given an expiry, since a row vanishing on its own would leave its indexes out of step.
 
 ### How the B-tree index works
 
@@ -669,6 +693,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 10a. Binary row format: SQL scans 3 to 5x faster, old JSON rows still readable
 - [x] 10b. A simple query planner: primary key conditions joined by `AND` become key lookups and range walks, `EXPLAIN` shows the plan
 - [x] 10c. Secondary indexes (`CREATE INDEX`), so the planner can use columns other than the primary key
+- [x] 11. Expiring keys: `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, with deadlines saved in the log
 
 ## Author
 

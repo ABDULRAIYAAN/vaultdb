@@ -1,7 +1,7 @@
 // Package aol is VaultDB's append-only log: the file that makes data survive
 // a restart.
 //
-// The idea: never edit data in place. Every change (SET, DEL, CLEAR) is
+// The idea: never edit data in place. Every change (SET, DEL, CLEAR, EXPIRE) is
 // appended to the end of one file as a record. On startup, the database reads
 // the file from the beginning and replays every record, rebuilding the
 // in-memory map exactly as it was. Redis (AOF), Bitcask and the write-ahead
@@ -57,9 +57,14 @@ const (
 	OpSet    Op = 1
 	OpDelete Op = 2
 	OpClear  Op = 3
+	// OpExpire gives Key a deadline. Value is the deadline as Unix
+	// milliseconds in decimal, or empty to remove the deadline (PERSIST).
+	// It is only ever written after the SET it belongs to, so replaying the
+	// log in order rebuilds both the value and when it runs out.
+	OpExpire Op = 4
 )
 
-func (o Op) valid() bool { return o >= OpSet && o <= OpClear }
+func (o Op) valid() bool { return o >= OpSet && o <= OpExpire }
 
 const (
 	magic         = "VAULTDB\x00"
