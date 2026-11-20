@@ -47,7 +47,7 @@ func TestSession(t *testing.T) {
 func TestErrors(t *testing.T) {
 	e := New(store.New())
 	cases := map[string]string{
-		`SET onlykey`: `(error) usage: SET <key> <value>`,
+		`SET onlykey`: `(error) usage: SET <key> <value> [EX <seconds> | PX <ms> | KEEPTTL] [NX | XX]`,
 		`GET`:         `(error) usage: GET <key>`,
 		`SET "" v`:    `(error) key must not be empty`,
 		`FLY away`:    `(error) unknown command "FLY", type HELP for the list`,
@@ -212,5 +212,62 @@ func TestExpiryCommands(t *testing.T) {
 		if got := run(t, e, in); got != want {
 			t.Errorf("%s after expiry = %s, want %s", in, got, want)
 		}
+	}
+}
+
+func TestSetOptions(t *testing.T) {
+	e := New(store.New())
+	const managedErr = "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
+	steps := []struct{ in, want string }{
+		{`SET otp 481516 EX 30`, "OK"},
+		{`TTL otp`, "(integer) 30"},
+		{`SET otp 123456 KEEPTTL`, "OK"},
+		{`TTL otp`, "(integer) 30"},
+		{`GET otp`, `"123456"`},
+		{`SET otp plain`, "OK"},
+		{`TTL otp`, "(integer) -1"},
+		{`SET cache v px 90000`, "OK"}, // options are case-insensitive
+		{`TTL cache`, "(integer) 90"},
+		{`SET lock alice NX EX 10`, "OK"},
+		{`SET lock bob EX 10 NX`, "(nil)"}, // any order
+		{`GET lock`, `"alice"`},
+		{`SET lock carol XX KEEPTTL`, "OK"},
+		{`TTL lock`, "(integer) 10"},
+		{`SET ghost x XX`, "(nil)"},
+		{`EXISTS ghost`, "(integer) 0"},
+		{`SET "with space" "a b" ex 5`, "OK"},
+		{`TTL "with space"`, "(integer) 5"},
+
+		{`SET k v EX`, "(error) EX needs a number of seconds"},
+		{`SET k v PX`, "(error) PX needs a number of milliseconds"},
+		{`SET k v EX 0`, "(error) EX must be a whole number of seconds above zero"},
+		{`SET k v EX -5`, "(error) EX must be a whole number of seconds above zero"},
+		{`SET k v PX soon`, "(error) PX must be a whole number of milliseconds above zero"},
+		{`SET k v EX 99999999999`, "(error) time to live is too long (the limit is 100 years)"},
+		{`SET k v EX 10 PX 100`, "(error) SET takes only one of EX, PX and KEEPTTL"},
+		{`SET k v EX 10 KEEPTTL`, "(error) SET takes only one of EX, PX and KEEPTTL"},
+		{`SET k v NX XX`, "(error) SET takes only one of NX and XX"},
+		{`SET k v NX NX`, "(error) SET takes only one of NX and XX"},
+		{`SET k v GET`, `(error) unknown SET option "GET" (expected EX, PX, KEEPTTL, NX or XX)`},
+		{`SET k v 10`, `(error) unknown SET option "10" (expected EX, PX, KEEPTTL, NX or XX)`},
+		{`EXISTS k`, "(integer) 0"},
+		{`SET sql:row:t:1 x EX 10`, managedErr},
+	}
+	for _, s := range steps {
+		if got := run(t, e, s.in); got != s.want {
+			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
+	}
+
+	// With the real clock: SET ... PX 1 is gone a little later.
+	if got := run(t, e, `SET blink x PX 1`); got != "OK" {
+		t.Fatalf("SET blink x PX 1 = %s", got)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := run(t, e, `GET blink`); got != "(nil)" {
+		t.Fatalf("GET blink after expiry = %s", got)
+	}
+	if got := run(t, e, `SET blink y NX`); got != "OK" {
+		t.Fatalf("SET NX on an expired key = %s, want OK", got)
 	}
 }

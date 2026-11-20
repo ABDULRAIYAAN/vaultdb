@@ -60,6 +60,7 @@ func TestRoundTrip(t *testing.T) {
 		set("unicode", "سلام 你好"),
 		{Op: OpExpire, Key: "bio", Value: "1700000000000"},
 		{Op: OpExpire, Key: "bio"}, // PERSIST
+		{Op: OpSetExpire, Key: "otp", Value: SetExpireValue(1700000060000, "481516")},
 		{Op: OpDelete, Key: "name"},
 		{Op: OpClear},
 	}
@@ -311,5 +312,37 @@ func TestAppendRules(t *testing.T) {
 	}
 	if err := l.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestSetExpireValue(t *testing.T) {
+	for _, c := range []struct {
+		at  int64
+		val string
+	}{{1700000060000, "481516"}, {0, ""}, {-1, "neg"}, {1<<62 + 5, "\x00\xff bytes"}} {
+		at, val, ok := SplitSetExpire(SetExpireValue(c.at, c.val))
+		if !ok || at != c.at || val != c.val {
+			t.Errorf("round trip of (%d, %q) = (%d, %q, %v)", c.at, c.val, at, val, ok)
+		}
+	}
+	if len(SetExpireValue(1, "abc")) != DeadlineSize+3 {
+		t.Error("SetExpireValue is not DeadlineSize bytes plus the value")
+	}
+	if _, _, ok := SplitSetExpire("short"); ok {
+		t.Error("SplitSetExpire accepted a value shorter than a deadline")
+	}
+}
+
+// SETEX came after format version 1 as well.
+func TestLegacyLogHasNoSetExpire(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.log")
+	writeV1(t, path, set("name", "raiyaan"), Record{Op: OpSetExpire, Key: "otp", Value: SetExpireValue(1, "x")})
+	l, err := Open(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if _, err := l.Replay(func(Record) {}, ReplayOptions{}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Replay = %v, want ErrCorrupt", err)
 	}
 }

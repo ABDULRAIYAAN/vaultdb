@@ -206,9 +206,9 @@ func TestDeadlinesSurviveRestart(t *testing.T) {
 	}
 }
 
-// TestExpiryMatchesModel runs random writes, expiries, clock jumps,
-// compactions and restarts, and checks the store against a plain map after
-// every step. After each compaction the log has to weigh exactly what
+// TestExpiryMatchesModel runs random writes (plain and with SET options),
+// expiries, clock jumps, compactions and restarts, and checks the store
+// against a plain map after every step. After each compaction the log has to weigh exactly what
 // liveBytes said it would, which checks the size bookkeeping too.
 func TestExpiryMatchesModel(t *testing.T) {
 	c := newClock()
@@ -236,10 +236,41 @@ func TestExpiryMatchesModel(t *testing.T) {
 	key := func() string { return fmt.Sprintf("k%02d", rng.Intn(40)) }
 	for step := 0; step < 4000; step++ {
 		switch r := rng.Intn(100); {
-		case r < 35:
+		case r < 20:
 			k, v := key(), fmt.Sprint(rng.Intn(1000))
 			s.Set(k, v)
 			model[k] = entry{val: v}
+		case r < 35:
+			// SET with EX, KEEPTTL, NX or XX, in random valid mixes.
+			k, v := key(), fmt.Sprint(rng.Intn(1000))
+			var o SetOptions
+			switch rng.Intn(3) {
+			case 0:
+				o.TTL = time.Duration(rng.Intn(5000)+1) * time.Millisecond
+			case 1:
+				o.KeepTTL = true
+			}
+			switch rng.Intn(3) {
+			case 0:
+				o.IfMissing = true
+			case 1:
+				o.IfExists = true
+			}
+			e, ok := live(k)
+			want := !(o.IfMissing && ok) && !(o.IfExists && !ok)
+			got, err := s.SetWith(k, v, o)
+			if err != nil || got != want {
+				t.Fatalf("step %d: SetWith(%s, %+v) = %v, %v; want %v", step, k, o, got, err, want)
+			}
+			if want {
+				n := entry{val: v}
+				if o.TTL > 0 {
+					n.at = nowMs() + o.TTL.Milliseconds()
+				} else if o.KeepTTL && ok {
+					n.at = e.at
+				}
+				model[k] = n
+			}
 		case r < 45:
 			k := key()
 			_, want := live(k)

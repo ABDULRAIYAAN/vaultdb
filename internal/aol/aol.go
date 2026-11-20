@@ -1,7 +1,8 @@
 // Package aol is VaultDB's append-only log: the file that makes data survive
 // a restart.
 //
-// The idea: never edit data in place. Every change (SET, DEL, CLEAR, EXPIRE) is
+// The idea: never edit data in place. Every change (SET, DEL, CLEAR, EXPIRE,
+// SETEX) is
 // appended to the end of one file as a record. On startup, the database reads
 // the file from the beginning and replays every record, rebuilding the
 // in-memory map exactly as it was. Redis (AOF), Bitcask and the write-ahead
@@ -19,6 +20,7 @@
 //	+-------------+--------+------------+------------+--------------+-----+-------+
 //	| hdrCRC (4)  | op (1) | keyLen (4) | valLen (4) | bodyCRC (4)  | key | value |
 //	+-------------+--------+------------+------------+--------------+-----+-------+
+//	 op      = 1 SET, 2 DEL, 3 CLEAR, 4 EXPIRE, 5 SETEX
 //	 hdrCRC  = CRC-32C of op, keyLen, valLen and bodyCRC
 //	 bodyCRC = CRC-32C of key and value
 //
@@ -62,9 +64,38 @@ const (
 	// It is only ever written after the SET it belongs to, so replaying the
 	// log in order rebuilds both the value and when it runs out.
 	OpExpire Op = 4
+	// OpSetExpire stores a value under Key and gives it a deadline, in one
+	// record. Value is the deadline as DeadlineSize big-endian bytes of Unix
+	// milliseconds, followed by the value itself (see SetExpireValue).
+	//
+	// It exists so that "set this key, and make it expire" can't be torn in
+	// half by a crash: as a SET followed by an EXPIRE, losing the second
+	// record would leave a key that never goes away.
+	OpSetExpire Op = 5
 )
 
-func (o Op) valid() bool { return o >= OpSet && o <= OpExpire }
+func (o Op) valid() bool { return o >= OpSet && o <= OpSetExpire }
+
+// DeadlineSize is how many bytes the deadline takes at the start of an
+// OpSetExpire value.
+const DeadlineSize = 8
+
+// SetExpireValue builds the Value of an OpSetExpire record.
+func SetExpireValue(deadline int64, value string) string {
+	b := make([]byte, DeadlineSize+len(value))
+	binary.BigEndian.PutUint64(b, uint64(deadline))
+	copy(b[DeadlineSize:], value)
+	return string(b)
+}
+
+// SplitSetExpire takes an OpSetExpire Value apart again. ok is false if it
+// is too short to hold a deadline.
+func SplitSetExpire(v string) (deadline int64, value string, ok bool) {
+	if len(v) < DeadlineSize {
+		return 0, "", false
+	}
+	return int64(binary.BigEndian.Uint64([]byte(v[:DeadlineSize]))), v[DeadlineSize:], true
+}
 
 const (
 	magic         = "VAULTDB\x00"

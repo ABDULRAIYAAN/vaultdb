@@ -150,8 +150,8 @@ func Open(path string, opts Options) (*Store, OpenInfo, error) {
 // apply changes the map for one record and keeps liveBytes in step. The
 // caller holds the lock (or, during replay, nobody else can see the store).
 //
-// liveBytes counts what compaction would write: one SET per key, plus one
-// EXPIRE for each key with a deadline.
+// liveBytes counts what compaction would write: one SET per key, or one
+// SETEX (DeadlineSize bytes bigger) for a key with a deadline.
 func (s *Store) apply(r aol.Record) {
 	switch r.Op {
 	case aol.OpSet:
@@ -180,9 +180,22 @@ func (s *Store) apply(r aol.Record) {
 		if err != nil {
 			return // checksummed, so only a buggy writer could get here
 		}
-		s.expires[r.Key] = at
-		s.liveBytes += aol.RecordSize(r.Key, r.Value)
+		s.setDeadline(r.Key, at)
+	case aol.OpSetExpire:
+		at, v, ok := aol.SplitSetExpire(r.Value)
+		if !ok {
+			return // checksummed, so only a buggy writer could get here
+		}
+		s.apply(aol.Record{Op: aol.OpSet, Key: r.Key, Value: v})
+		s.setDeadline(r.Key, at)
 	}
+}
+
+// setDeadline records key's deadline. The key exists and has none (the
+// caller has just cleared it).
+func (s *Store) setDeadline(key string, at int64) {
+	s.expires[key] = at
+	s.liveBytes += aol.DeadlineSize
 }
 
 // drop removes key and its deadline from memory, keeping liveBytes in step.
@@ -197,8 +210,8 @@ func (s *Store) drop(key string) {
 
 // clearDeadline forgets key's deadline, if it has one.
 func (s *Store) clearDeadline(key string) {
-	if at, ok := s.expires[key]; ok {
-		s.liveBytes -= aol.RecordSize(key, deadlineString(at))
+	if _, ok := s.expires[key]; ok {
+		s.liveBytes -= aol.DeadlineSize
 		delete(s.expires, key)
 	}
 }
@@ -238,7 +251,8 @@ type CompactResult struct {
 	BytesAfter  int64
 }
 
-// Compact rewrites the log so it holds exactly one SET record per key.
+// Compact rewrites the log so it holds exactly one record per key: a SET, or
+// a SETEX for a key with a deadline.
 func (s *Store) Compact() (CompactResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -260,9 +274,10 @@ func (s *Store) compactLocked() error {
 	err := s.log.Rewrite(func(emit func(aol.Record) error) error {
 		var emitErr error
 		s.data.Ascend("", "", func(k, v string) bool {
-			emitErr = emit(aol.Record{Op: aol.OpSet, Key: k, Value: v})
-			if at, ok := s.expires[k]; ok && emitErr == nil {
-				emitErr = emit(aol.Record{Op: aol.OpExpire, Key: k, Value: deadlineString(at)})
+			if at, ok := s.expires[k]; ok {
+				emitErr = emit(aol.Record{Op: aol.OpSetExpire, Key: k, Value: aol.SetExpireValue(at, v)})
+			} else {
+				emitErr = emit(aol.Record{Op: aol.OpSet, Key: k, Value: v})
 			}
 			return emitErr == nil
 		})

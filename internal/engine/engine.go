@@ -19,6 +19,8 @@ import (
 // HelpText lists every supported command.
 const HelpText = `Commands:
   SET <key> <value>   store a value (use "quotes" for spaces)
+      [EX <seconds> | PX <ms> | KEEPTTL]  expire it, or keep its current expiry
+      [NX | XX]                           only if the key is missing / exists
   GET <key>           read a value
   DEL <key>           delete a key
   EXISTS <key>        1 if the key exists, 0 if not
@@ -127,11 +129,19 @@ func (e *Engine) Execute(cmd parser.Command) string {
 	}
 	switch cmd.Name {
 	case "SET":
-		if len(cmd.Args) != 2 {
-			return usage("SET <key> <value>")
+		if len(cmd.Args) < 2 {
+			return usage(setUsage)
 		}
-		if err := e.store.Set(cmd.Args[0], cmd.Args[1]); err != nil {
+		opts, err := parseSetOptions(cmd.Args[2:])
+		if err != nil {
 			return "(error) " + err.Error()
+		}
+		wrote, err := e.store.SetWith(cmd.Args[0], cmd.Args[1], opts)
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		if !wrote {
+			return "(nil)" // NX or XX said no, like Redis
 		}
 		return "OK"
 
@@ -313,6 +323,55 @@ func (e *Engine) Execute(cmd parser.Command) string {
 	default:
 		return fmt.Sprintf("(error) unknown command %q, type HELP for the list", cmd.Name)
 	}
+}
+
+const setUsage = "SET <key> <value> [EX <seconds> | PX <ms> | KEEPTTL] [NX | XX]"
+
+// parseSetOptions reads the words after SET's key and value. They can come
+// in any order and any case, but each group (EX/PX/KEEPTTL, NX/XX) at most
+// once.
+func parseSetOptions(args []string) (store.SetOptions, error) {
+	var o store.SetOptions
+	expiry, cond := "", ""
+	for i := 0; i < len(args); i++ {
+		word := strings.ToUpper(args[i])
+		switch word {
+		case "EX", "PX", "KEEPTTL":
+			if expiry != "" {
+				return o, fmt.Errorf("SET takes only one of EX, PX and KEEPTTL")
+			}
+			expiry = word
+			if word == "KEEPTTL" {
+				o.KeepTTL = true
+				continue
+			}
+			unit, name := time.Second, "seconds"
+			if word == "PX" {
+				unit, name = time.Millisecond, "milliseconds"
+			}
+			if i+1 == len(args) {
+				return o, fmt.Errorf("%s needs a number of %s", word, name)
+			}
+			i++
+			n, err := strconv.ParseInt(args[i], 10, 64)
+			if err != nil || n <= 0 {
+				return o, fmt.Errorf("%s must be a whole number of %s above zero", word, name)
+			}
+			if n > int64(store.MaxTTL/unit) {
+				return o, store.ErrTTLTooLong
+			}
+			o.TTL = time.Duration(n) * unit
+		case "NX", "XX":
+			if cond != "" {
+				return o, fmt.Errorf("SET takes only one of NX and XX")
+			}
+			cond = word
+			o.IfMissing, o.IfExists = word == "NX", word == "XX"
+		default:
+			return o, fmt.Errorf("unknown SET option %q (expected EX, PX, KEEPTTL, NX or XX)", args[i])
+		}
+	}
+	return o, nil
 }
 
 // vectorCommand runs V... commands. ok is false if cmd is not one of them.

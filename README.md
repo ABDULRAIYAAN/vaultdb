@@ -23,7 +23,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`EXPIRE`, `TTL`, `PERSIST`) whose deadlines survive restarts, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`SET ... EX`, `EXPIRE`, `TTL`, `PERSIST`) whose deadlines survive restarts, with `NX`/`XX` for set-if-missing and set-if-exists, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -545,6 +545,9 @@ The decoder checks everything it reads (value count, each tag against the column
 | Command | What it does |
 |---|---|
 | `SET <key> <value>` | Store a value. Use `"quotes"` for values with spaces |
+| `SET <key> <value> EX <seconds>` / `PX <ms>` | Store it and make it expire, in one step that a crash can't split |
+| `SET <key> <value> KEEPTTL` | Replace the value but keep the key's current expiry (a plain `SET` clears it) |
+| `SET <key> <value> NX` / `XX` | Only if the key doesn't exist / already exists. Replies `(nil)` if nothing was written. Combines with `EX`, `PX` or `KEEPTTL`, in any order |
 | `GET <key>` | Read a value, or `(nil)` if missing |
 | `DEL <key>` | Delete a key. Returns 1 if it existed, 0 if not |
 | `EXISTS <key>` | 1 if the key exists, 0 if not |
@@ -614,6 +617,7 @@ The file starts with a 9-byte header (`VAULTDB\0` plus a format version byte), f
 +------------+--------+------------+------------+-------------+-----+-------+
  op: 1 = SET, 2 = DEL, 3 = CLEAR,        all integers big-endian
      4 = EXPIRE (value: deadline in Unix ms, empty = PERSIST)
+     5 = SETEX  (value: 8-byte deadline in Unix ms, then the value)
  hdrCRC  = CRC-32C of op, keyLen, valLen, bodyCRC
  bodyCRC = CRC-32C of key and value
 ```
@@ -639,6 +643,19 @@ vaultdb> TTL session
 
 `EXPIRE` writes one `EXPIRE` record to the log, right after the key's `SET`, holding the **absolute deadline** in Unix milliseconds rather than "60 seconds". So a restart doesn't hand the key a fresh minute: replay rebuilds the key and its deadline, and keys that ran out while the database was closed are dropped as it opens. A plain `SET` replaces the value and clears the deadline, like in Redis.
 
+`SET key value EX 60` (or `PX` in milliseconds) does both at once, and writes them as **one** `SETEX` record: the deadline in 8 bytes, then the value. That matters for crashes. As a `SET` followed by an `EXPIRE`, a power cut between the two would keep the value and lose the deadline, and a lock or one-time code would then never go away. A single checksummed record is either all on disk or cut off and dropped on the next start. Compaction also writes every key that has a deadline as one `SETEX`, which is 22 bytes plus the key's length smaller than the pair.
+
+`NX` and `XX` make `SET` conditional, which together with `EX` is the usual way to take a lock: `SET lock <token> NX EX 30` succeeds for only one client, and the lock frees itself if that client dies. An expired key counts as missing. `KEEPTTL` replaces the value without touching the deadline.
+
+```
+vaultdb> SET lock worker-1 NX EX 30
+OK
+vaultdb> SET lock worker-2 NX EX 30
+(nil)
+vaultdb> TTL lock
+(integer) 30
+```
+
 Removing an expired key from memory is **lazy**, like Redis. From the deadline on, every read (`GET`, `EXISTS`, `KEYS`, `SCAN`, `PREFIX`, `COUNT`) skips the key, so it is gone as far as anyone can tell. The memory is freed when a write touches that key, after every write (which checks up to 20 keys that have a deadline and drops the expired ones), at compaction (which also leaves them out of the new log) and on startup. None of these write a `DEL`: the log already says when the key runs out, so replaying it always comes to the same answer, as long as the clock doesn't go backwards between runs. Keys under `sql:` and `vec:` can't be given an expiry, since a row vanishing on its own would leave its indexes out of step.
 
 ### How the B-tree index works
@@ -658,7 +675,7 @@ Keys are kept in a **B-tree**, the structure behind the indexes in Postgres, MyS
 
 ### How compaction works
 
-Overwriting a key 1,000 times leaves 999 dead records in the log. VaultDB tracks how big the log *would* be with one `SET` per live key, and when the real file is at least 1 MB and more than twice that size, it compacts:
+Overwriting a key 1,000 times leaves 999 dead records in the log. VaultDB tracks how big the log *would* be with one record per live key (a `SET`, or a `SETEX` for a key with an expiry), and when the real file is at least 1 MB and more than twice that size, it compacts:
 
 1. Write the current data to a temporary file, `vaultdb.log.compact`.
 2. `fsync` the temporary file so it is fully on disk.
@@ -694,6 +711,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 10b. A simple query planner: primary key conditions joined by `AND` become key lookups and range walks, `EXPLAIN` shows the plan
 - [x] 10c. Secondary indexes (`CREATE INDEX`), so the planner can use columns other than the primary key
 - [x] 11. Expiring keys: `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, with deadlines saved in the log
+- [x] 11b. `SET` options: `EX`/`PX` (value and expiry in one crash-safe record), `KEEPTTL`, `NX`/`XX`
 
 ## Author
 

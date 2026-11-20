@@ -35,6 +35,9 @@ import (
 // clock doesn't go backwards between runs.
 //
 // A plain SET replaces a key's value and clears its deadline, like Redis.
+// SetWith can set a value and a deadline together (SET ... EX), which is one
+// SETEX record in the log, so a crash can never keep the value but lose the
+// deadline. Compaction writes every key that has a deadline as a SETEX too.
 
 // MaxTTL is the longest time to live a key can be given, so that a deadline
 // always fits in a time.Duration and an int64 of milliseconds.
@@ -61,9 +64,64 @@ func (s *Store) Expire(key string, d time.Duration) (bool, error) {
 	if d <= 0 {
 		return true, s.write(aol.Record{Op: aol.OpDelete, Key: key})
 	}
-	ms := int64((d + time.Millisecond - 1) / time.Millisecond)
-	at := s.nowMs() + ms
+	// Compaction will write the key as one SETEX, deadline first, so the
+	// value has to leave room for it.
+	if v, _ := s.data.Get(key); len(v) > aol.MaxFieldSize-aol.DeadlineSize {
+		return false, aol.ErrTooLarge
+	}
+	at := s.nowMs() + ceilMs(d)
 	return true, s.write(aol.Record{Op: aol.OpExpire, Key: key, Value: deadlineString(at)})
+}
+
+// SetOptions changes what SetWith does. The zero value is a plain Set.
+type SetOptions struct {
+	// TTL, if above zero, makes the key expire this long from now. Under a
+	// millisecond rounds up to one.
+	TTL time.Duration
+	// KeepTTL keeps the key's current deadline instead of clearing it.
+	KeepTTL bool
+	// IfMissing only writes if the key doesn't exist (NX); IfExists only
+	// if it does (XX).
+	IfMissing, IfExists bool
+}
+
+// ErrBadSetOptions is returned by SetWith for options that contradict each
+// other.
+var ErrBadSetOptions = errors.New("bad SET options: a negative TTL, a TTL with KeepTTL, or IfMissing with IfExists")
+
+// SetWith stores value under key like Set, with the extras in o, and reports
+// whether it wrote anything (false when IfMissing or IfExists said no).
+//
+// A value with a deadline is written as a single SETEX record, so the value
+// and the deadline reach the disk together or not at all.
+func (s *Store) SetWith(key, value string, o SetOptions) (bool, error) {
+	switch {
+	case key == "":
+		return false, ErrEmptyKey
+	case o.TTL < 0, o.TTL > 0 && o.KeepTTL, o.IfMissing && o.IfExists:
+		return false, ErrBadSetOptions
+	case o.TTL > MaxTTL:
+		return false, ErrTTLTooLong
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	live := s.liveLocked(key)
+	if (o.IfMissing && live) || (o.IfExists && !live) {
+		return false, nil
+	}
+	var at int64 // deadline, 0 for none
+	if o.TTL > 0 {
+		at = s.nowMs() + ceilMs(o.TTL)
+	} else if o.KeepTTL && live {
+		at = s.expires[key] // 0 if it has none
+	}
+	if at == 0 {
+		return true, s.write(aol.Record{Op: aol.OpSet, Key: key, Value: value})
+	}
+	if len(value) > aol.MaxFieldSize-aol.DeadlineSize {
+		return false, aol.ErrTooLarge // checked here too for in-memory stores
+	}
+	return true, s.write(aol.Record{Op: aol.OpSetExpire, Key: key, Value: aol.SetExpireValue(at, value)})
 }
 
 // Persist removes key's deadline, so it lives until deleted. It reports
@@ -98,6 +156,9 @@ func (s *Store) TTL(key string) (left time.Duration, hasDeadline bool, err error
 }
 
 func (s *Store) nowMs() int64 { return s.now().UnixMilli() }
+
+// ceilMs is d in whole milliseconds, rounded up.
+func ceilMs(d time.Duration) int64 { return int64((d + time.Millisecond - 1) / time.Millisecond) }
 
 func deadlineString(at int64) string { return strconv.FormatInt(at, 10) }
 
