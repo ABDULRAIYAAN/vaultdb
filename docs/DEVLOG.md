@@ -217,3 +217,22 @@ How it works:
 Tests: the option rules (NX/XX on missing, live and just-expired keys, KEEPTTL with and without a deadline, rounding, every bad combination); `TestSetWithCrashNeverLosesDeadline`, which cuts the log after every possible byte of a `SET ... NX EX` and checks the key is either missing or has its deadline, never there forever; a compaction test that checks the new log is exactly the size `liveBytes` predicted and comes back as one record per key; `SetWith` added to the random model test with random option mixes; and engine tests for the parsing and error messages. I broke it five ways on purpose (writing `SET` then `EXPIRE`, `KEEPTTL` dropping the deadline, not subtracting the 8 bytes when a deadline is cleared, compaction writing plain `SET`s, `NX` not treating an expired key as missing) and each one fails at least one test.
 
 Not done yet: `SET ... GET` (return the old value) and `EXAT`/`PXAT` (an absolute deadline). The playground is still on the old WebAssembly build.
+
+## 2026-11-21: Absolute deadlines and SET ... GET
+
+Yesterday's two leftovers. `SET key value EXAT <unix-seconds>` (or `PXAT` in milliseconds) stores a value that expires at a set moment, `EXPIREAT` / `PEXPIREAT` do the same for a key that's already there, and `EXPIRETIME` / `PEXPIRETIME` read the deadline back as a Unix time (`-1` for none, `-2` for no key, like `TTL`). `SET ... GET` replies with the value it replaced instead of `OK`. The store side is `ExpireAt`, `Deadline` and `SetWithOld` in `internal/store/ttl.go`.
+
+Why: a deadline often comes from somewhere else, like a token's `exp` field or the end of a sale, and turning it into "seconds from now" on the client is a race: the number is already stale by the time the command arrives. `SET ... GET` is the other half of a safe swap. Doing `GET` then `SET` from a client lets another client's write land in between, and you get back a value that was never the one you replaced.
+
+How it works:
+
+- No new log records. The log already stores deadlines as absolute Unix milliseconds, so `EXAT` writes the same `SETEX` as `EX` and `EXPIREAT` the same `EXPIRE` as `EXPIRE`. Only how the deadline is worked out changed.
+- A moment that has already come deletes the key, the way Redis does. `EXPIREAT` writes a `DEL` and replies 1. `SET ... EXAT` with a past time replies `OK` but leaves the key gone, and on a key that didn't exist it writes nothing at all, since there's nothing to delete.
+- Times between two milliseconds round up, same as durations, so a key never goes before the moment it was given. The "already past" check is done on the full time, before rounding. Otherwise `EXPIREAT key <now>` with the clock at 5.3 ms would round up to 6 ms and keep the key alive for a moment.
+- The 100-year limit still holds: a deadline more than `MaxTTL` from now is refused, checked against the store's own clock under the lock. `EXAT` seconds are checked for overflow before they're multiplied into milliseconds.
+- `SetWithOld` reads the old value and writes the new one under the same write lock, so nothing can slip between them. An expired key counts as having no old value. With `NX` on a live key, the write is refused but the old value still comes back (Redis 7 does this too), so `SET k v NX GET` tells you both that you lost and what you lost to. `SetWith` now just calls it and drops the extras.
+- `EXPIRETIME` rounds down to the second, like Redis, while `PEXPIRETIME` is exact. `EXPIREAT` and `PEXPIREAT` are refused on `sql:` and `vec:` keys like every other write.
+
+Tests: `ExpireAt` and `Deadline` on live, missing, expired and plain keys, sub-millisecond rounding, past moments (including with the clock between two milliseconds) and the 100-year limit; `SetWithOld` with `NX`/`XX`, expired keys and past deadlines; a restart test where some absolute deadlines pass while the database is closed; and the random model test from two days ago now also sends `EXAT` (some already past) and `ExpireAt`, checks every old value `SetWithOld` hands back, and checks `Deadline` for every key after every step. Engine tests cover parsing, replies and every error message. I broke it seven ways on purpose (no rounding up, `NX` dropping the old value, an expired key's value counted as old, no 100-year check, `EXPIRETIME` losing the milliseconds, and `EXPIREAT`/`SET EXAT` with "now" not deleting) and each one fails at least one test.
+
+Not done yet: `GETDEL` and `GETEX`, and `EXPIRE`'s `NX`/`XX`/`GT`/`LT` options. The playground is still on the old WebAssembly build.

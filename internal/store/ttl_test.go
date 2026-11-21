@@ -241,14 +241,17 @@ func TestExpiryMatchesModel(t *testing.T) {
 			s.Set(k, v)
 			model[k] = entry{val: v}
 		case r < 35:
-			// SET with EX, KEEPTTL, NX or XX, in random valid mixes.
+			// SET with EX, EXAT (sometimes already past), KEEPTTL, NX or XX,
+			// in random valid mixes, checking the old value it hands back.
 			k, v := key(), fmt.Sprint(rng.Intn(1000))
 			var o SetOptions
-			switch rng.Intn(3) {
+			switch rng.Intn(4) {
 			case 0:
 				o.TTL = time.Duration(rng.Intn(5000)+1) * time.Millisecond
 			case 1:
 				o.KeepTTL = true
+			case 2:
+				o.At = time.UnixMilli(nowMs() + int64(rng.Intn(5000)-1000))
 			}
 			switch rng.Intn(3) {
 			case 0:
@@ -258,18 +261,23 @@ func TestExpiryMatchesModel(t *testing.T) {
 			}
 			e, ok := live(k)
 			want := !(o.IfMissing && ok) && !(o.IfExists && !ok)
-			got, err := s.SetWith(k, v, o)
-			if err != nil || got != want {
-				t.Fatalf("step %d: SetWith(%s, %+v) = %v, %v; want %v", step, k, o, got, err, want)
+			old, existed, got, err := s.SetWithOld(k, v, o)
+			if err != nil || got != want || existed != ok || old != e.val {
+				t.Fatalf("step %d: SetWithOld(%s, %+v) = %q, %v, %v, %v; want %q, %v, %v",
+					step, k, o, old, existed, got, err, e.val, ok, want)
 			}
 			if want {
 				n := entry{val: v}
-				if o.TTL > 0 {
+				switch {
+				case o.TTL > 0:
 					n.at = nowMs() + o.TTL.Milliseconds()
-				} else if o.KeepTTL && ok {
+				case !o.At.IsZero():
+					n.at = o.At.UnixMilli()
+				case o.KeepTTL && ok:
 					n.at = e.at
 				}
 				model[k] = n
+				live(k) // drops it if the deadline has already come
 			}
 		case r < 45:
 			k := key()
@@ -283,7 +291,13 @@ func TestExpiryMatchesModel(t *testing.T) {
 			k := key()
 			d := time.Duration(rng.Intn(5000)-500) * time.Millisecond
 			e, want := live(k)
-			got, err := s.Expire(k, d)
+			var got bool
+			var err error
+			if rng.Intn(2) == 0 {
+				got, err = s.Expire(k, d)
+			} else {
+				got, err = s.ExpireAt(k, time.UnixMilli(nowMs()+d.Milliseconds()))
+			}
 			if err != nil || got != want {
 				t.Fatalf("step %d: Expire(%s, %v) = %v, %v; want %v", step, k, d, got, err, want)
 			}
@@ -338,6 +352,9 @@ func TestExpiryMatchesModel(t *testing.T) {
 			left, has, _ := s.TTL(k)
 			if v != e.val || has != (e.at != 0) || (has && left != time.Duration(e.at-nowMs())*time.Millisecond) {
 				t.Fatalf("step %d: %s = %q, ttl %v %v; want %q, deadline %d", step, k, v, left, has, e.val, e.at)
+			}
+			if at, has, err := s.Deadline(k); err != nil || has != (e.at != 0) || (has && at.UnixMilli() != e.at) {
+				t.Fatalf("step %d: Deadline(%s) = %v, %v, %v; want %d", step, k, at, has, err, e.at)
 			}
 		}
 	}

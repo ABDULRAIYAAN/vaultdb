@@ -10,7 +10,8 @@ import (
 
 // Expiring keys
 //
-// A key can be given a deadline with Expire. Until then it behaves like any
+// A key can be given a deadline with Expire (a duration from now) or
+// ExpireAt (a moment), and Deadline reads it back. Until then it behaves like any
 // other key; from the deadline on it reads as missing everywhere (Get,
 // Exists, Keys, Scan, Prefix, Len), as if it had been deleted at that exact
 // moment.
@@ -64,13 +65,37 @@ func (s *Store) Expire(key string, d time.Duration) (bool, error) {
 	if d <= 0 {
 		return true, s.write(aol.Record{Op: aol.OpDelete, Key: key})
 	}
+	return true, s.expireLocked(key, s.nowMs()+ceilMs(d))
+}
+
+// ExpireAt is Expire with an absolute deadline (EXPIREAT, PEXPIREAT). A
+// moment that has already come deletes the key straight away, and one more
+// than MaxTTL away is refused. Times between two milliseconds round up.
+func (s *Store) ExpireAt(key string, at time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	if at.Sub(now) > MaxTTL {
+		return false, ErrTTLTooLong
+	}
+	if !s.liveLocked(key) {
+		return false, nil
+	}
+	if !at.After(now) {
+		return true, s.write(aol.Record{Op: aol.OpDelete, Key: key})
+	}
+	return true, s.expireLocked(key, ceilUnixMs(at))
+}
+
+// expireLocked writes key's new deadline. The key is live and the deadline
+// is in the future. Caller holds the write lock.
+func (s *Store) expireLocked(key string, at int64) error {
 	// Compaction will write the key as one SETEX, deadline first, so the
 	// value has to leave room for it.
 	if v, _ := s.data.Get(key); len(v) > aol.MaxFieldSize-aol.DeadlineSize {
-		return false, aol.ErrTooLarge
+		return aol.ErrTooLarge
 	}
-	at := s.nowMs() + ceilMs(d)
-	return true, s.write(aol.Record{Op: aol.OpExpire, Key: key, Value: deadlineString(at)})
+	return s.write(aol.Record{Op: aol.OpExpire, Key: key, Value: deadlineString(at)})
 }
 
 // SetOptions changes what SetWith does. The zero value is a plain Set.
@@ -78,6 +103,10 @@ type SetOptions struct {
 	// TTL, if above zero, makes the key expire this long from now. Under a
 	// millisecond rounds up to one.
 	TTL time.Duration
+	// At, if not the zero time, makes the key expire at that moment (EXAT,
+	// PXAT). A moment that has already come leaves the key deleted, the way
+	// Redis does it. Times between two milliseconds round up.
+	At time.Time
 	// KeepTTL keeps the key's current deadline instead of clearing it.
 	KeepTTL bool
 	// IfMissing only writes if the key doesn't exist (NX); IfExists only
@@ -87,41 +116,72 @@ type SetOptions struct {
 
 // ErrBadSetOptions is returned by SetWith for options that contradict each
 // other.
-var ErrBadSetOptions = errors.New("bad SET options: a negative TTL, a TTL with KeepTTL, or IfMissing with IfExists")
+var ErrBadSetOptions = errors.New("bad SET options: a negative TTL, more than one of TTL, At and KeepTTL, or IfMissing with IfExists")
 
 // SetWith stores value under key like Set, with the extras in o, and reports
-// whether it wrote anything (false when IfMissing or IfExists said no).
+// whether the SET went ahead (false when IfMissing or IfExists said no).
 //
 // A value with a deadline is written as a single SETEX record, so the value
 // and the deadline reach the disk together or not at all.
 func (s *Store) SetWith(key, value string, o SetOptions) (bool, error) {
+	_, _, wrote, err := s.SetWithOld(key, value, o)
+	return wrote, err
+}
+
+// SetWithOld is SetWith that also returns the value the key held just
+// before (SET ... GET). existed is false if the key was missing or had
+// expired. Reading the old value and writing the new one happen under the
+// same lock, so no other write can land in between, and the old value is
+// returned even when IfMissing stops the write.
+func (s *Store) SetWithOld(key, value string, o SetOptions) (old string, existed, wrote bool, err error) {
+	hasAt := !o.At.IsZero()
 	switch {
 	case key == "":
-		return false, ErrEmptyKey
-	case o.TTL < 0, o.TTL > 0 && o.KeepTTL, o.IfMissing && o.IfExists:
-		return false, ErrBadSetOptions
+		return "", false, false, ErrEmptyKey
+	case o.TTL < 0, o.TTL > 0 && (o.KeepTTL || hasAt), hasAt && o.KeepTTL, o.IfMissing && o.IfExists:
+		return "", false, false, ErrBadSetOptions
 	case o.TTL > MaxTTL:
-		return false, ErrTTLTooLong
+		return "", false, false, ErrTTLTooLong
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	live := s.liveLocked(key)
-	if (o.IfMissing && live) || (o.IfExists && !live) {
-		return false, nil
+	now := s.now()
+	if hasAt && o.At.Sub(now) > MaxTTL {
+		return "", false, false, ErrTTLTooLong
+	}
+	existed = s.liveLocked(key)
+	if existed {
+		old, _ = s.data.Get(key)
+	}
+	if (o.IfMissing && existed) || (o.IfExists && !existed) {
+		return old, existed, false, nil
 	}
 	var at int64 // deadline, 0 for none
-	if o.TTL > 0 {
+	switch {
+	case o.TTL > 0:
 		at = s.nowMs() + ceilMs(o.TTL)
-	} else if o.KeepTTL && live {
+	case hasAt && !o.At.After(now):
+		// Already past: the new value would be expired the moment it's
+		// stored, so the key just ends up gone. A missing key has nothing
+		// to delete and nothing needs logging.
+		if existed {
+			err = s.write(aol.Record{Op: aol.OpDelete, Key: key})
+		}
+		return old, existed, err == nil, err
+	case hasAt:
+		at = ceilUnixMs(o.At)
+	case o.KeepTTL && existed:
 		at = s.expires[key] // 0 if it has none
 	}
 	if at == 0 {
-		return true, s.write(aol.Record{Op: aol.OpSet, Key: key, Value: value})
+		err = s.write(aol.Record{Op: aol.OpSet, Key: key, Value: value})
+		return old, existed, err == nil, err
 	}
 	if len(value) > aol.MaxFieldSize-aol.DeadlineSize {
-		return false, aol.ErrTooLarge // checked here too for in-memory stores
+		return old, existed, false, aol.ErrTooLarge // checked here too for in-memory stores
 	}
-	return true, s.write(aol.Record{Op: aol.OpSetExpire, Key: key, Value: aol.SetExpireValue(at, value)})
+	err = s.write(aol.Record{Op: aol.OpSetExpire, Key: key, Value: aol.SetExpireValue(at, value)})
+	return old, existed, err == nil, err
 }
 
 // Persist removes key's deadline, so it lives until deleted. It reports
@@ -155,10 +215,35 @@ func (s *Store) TTL(key string) (left time.Duration, hasDeadline bool, err error
 	return time.Duration(at-now) * time.Millisecond, true, nil
 }
 
+// Deadline returns the moment key expires (EXPIRETIME, PEXPIRETIME), to the
+// millisecond. hasDeadline is false for a key that never expires, and err is
+// ErrNotFound if the key doesn't exist (or has already expired).
+func (s *Store) Deadline(key string) (at time.Time, hasDeadline bool, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.data.Get(key); !ok || s.expired(key, s.nowMs()) {
+		return time.Time{}, false, ErrNotFound
+	}
+	ms, ok := s.expires[key]
+	if !ok {
+		return time.Time{}, false, nil
+	}
+	return time.UnixMilli(ms), true, nil
+}
+
 func (s *Store) nowMs() int64 { return s.now().UnixMilli() }
 
 // ceilMs is d in whole milliseconds, rounded up.
 func ceilMs(d time.Duration) int64 { return int64((d + time.Millisecond - 1) / time.Millisecond) }
+
+// ceilUnixMs is t as Unix milliseconds, rounded up.
+func ceilUnixMs(t time.Time) int64 {
+	ms := t.UnixMilli() // rounds down, also before 1970
+	if t.After(time.UnixMilli(ms)) {
+		ms++
+	}
+	return ms
+}
 
 func deadlineString(at int64) string { return strconv.FormatInt(at, 10) }
 

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -47,7 +48,7 @@ func TestSession(t *testing.T) {
 func TestErrors(t *testing.T) {
 	e := New(store.New())
 	cases := map[string]string{
-		`SET onlykey`: `(error) usage: SET <key> <value> [EX <seconds> | PX <ms> | KEEPTTL] [NX | XX]`,
+		`SET onlykey`: `(error) usage: SET <key> <value> [EX <seconds> | PX <ms> | EXAT <unix-seconds> | PXAT <unix-ms> | KEEPTTL] [NX | XX] [GET]`,
 		`GET`:         `(error) usage: GET <key>`,
 		`SET "" v`:    `(error) key must not be empty`,
 		`FLY away`:    `(error) unknown command "FLY", type HELP for the list`,
@@ -244,12 +245,11 @@ func TestSetOptions(t *testing.T) {
 		{`SET k v EX -5`, "(error) EX must be a whole number of seconds above zero"},
 		{`SET k v PX soon`, "(error) PX must be a whole number of milliseconds above zero"},
 		{`SET k v EX 99999999999`, "(error) time to live is too long (the limit is 100 years)"},
-		{`SET k v EX 10 PX 100`, "(error) SET takes only one of EX, PX and KEEPTTL"},
-		{`SET k v EX 10 KEEPTTL`, "(error) SET takes only one of EX, PX and KEEPTTL"},
+		{`SET k v EX 10 PX 100`, "(error) SET takes only one of EX, PX, EXAT, PXAT and KEEPTTL"},
+		{`SET k v EX 10 KEEPTTL`, "(error) SET takes only one of EX, PX, EXAT, PXAT and KEEPTTL"},
 		{`SET k v NX XX`, "(error) SET takes only one of NX and XX"},
 		{`SET k v NX NX`, "(error) SET takes only one of NX and XX"},
-		{`SET k v GET`, `(error) unknown SET option "GET" (expected EX, PX, KEEPTTL, NX or XX)`},
-		{`SET k v 10`, `(error) unknown SET option "10" (expected EX, PX, KEEPTTL, NX or XX)`},
+		{`SET k v 10`, `(error) unknown SET option "10" (expected EX, PX, EXAT, PXAT, KEEPTTL, NX, XX or GET)`},
 		{`EXISTS k`, "(integer) 0"},
 		{`SET sql:row:t:1 x EX 10`, managedErr},
 	}
@@ -269,5 +269,91 @@ func TestSetOptions(t *testing.T) {
 	}
 	if got := run(t, e, `SET blink y NX`); got != "OK" {
 		t.Fatalf("SET NX on an expired key = %s, want OK", got)
+	}
+}
+
+func TestAbsoluteExpiryAndSetGet(t *testing.T) {
+	e := New(store.New())
+	const managedErr = "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
+	// A deadline an hour from now, on a whole second so EXAT and PXAT agree.
+	at := time.Now().Add(time.Hour).Truncate(time.Second)
+	sec, ms := strconv.FormatInt(at.Unix(), 10), strconv.FormatInt(at.UnixMilli(), 10)
+	steps := []struct{ in, want string }{
+		{`SET otp 481516 EXAT ` + sec, "OK"},
+		{`EXPIRETIME otp`, "(integer) " + sec},
+		{`PEXPIRETIME otp`, "(integer) " + ms},
+		{`TTL otp`, "(integer) 3600"},
+		{`SET otp 123456 pxat ` + ms, "OK"},
+		{`PEXPIRETIME otp`, "(integer) " + ms},
+		{`EXPIRETIME missing`, "(integer) -2"},
+		{`SET plain v`, "OK"},
+		{`EXPIRETIME plain`, "(integer) -1"},
+		{`EXPIREAT plain ` + sec, "(integer) 1"},
+		{`EXPIRETIME plain`, "(integer) " + sec},
+		{`PEXPIREAT plain ` + strconv.FormatInt(at.UnixMilli()+1500, 10), "(integer) 1"},
+		{`EXPIRETIME plain`, "(integer) " + strconv.FormatInt(at.Unix()+1, 10)}, // 1.5 s later rounds down
+		{`PEXPIRETIME plain`, "(integer) " + strconv.FormatInt(at.UnixMilli()+1500, 10)},
+		{`EXPIREAT missing ` + sec, "(integer) 0"},
+		{`EXISTS missing`, "(integer) 0"},
+		// A moment that has already come deletes the key.
+		{`EXPIREAT plain 1`, "(integer) 1"},
+		{`EXISTS plain`, "(integer) 0"},
+		{`SET k v`, "OK"},
+		{`PEXPIREAT k -99`, "(integer) 1"},
+		{`EXISTS k`, "(integer) 0"},
+		{`SET old v`, "OK"},
+		{`SET old new EXAT 1`, "OK"},
+		{`EXISTS old`, "(integer) 0"},
+		{`SET gone v PXAT 1`, "OK"},
+		{`EXISTS gone`, "(integer) 0"},
+
+		// GET replies with the value from before.
+		{`SET counter 1 GET`, "(nil)"},
+		{`SET counter 2 GET`, `"1"`},
+		{`SET counter 3 get EX 60`, `"2"`},
+		{`TTL counter`, "(integer) 60"},
+		{`SET counter 4 NX GET`, `"3"`}, // NX says no, the old value still comes back
+		{`GET counter`, `"3"`},
+		{`SET nobody x XX GET`, "(nil)"},
+		{`EXISTS nobody`, "(integer) 0"},
+		{`SET counter 5 GET KEEPTTL`, `"3"`},
+		{`TTL counter`, "(integer) 60"},
+		{`SET counter 6 GET EXAT 1`, `"5"`},
+		{`GET counter`, "(nil)"},
+
+		{`SET k v EXAT`, "(error) EXAT needs a number of Unix seconds"},
+		{`SET k v PXAT soon`, "(error) PXAT must be a whole number of Unix milliseconds above zero"},
+		{`SET k v EXAT 0`, "(error) EXAT must be a whole number of Unix seconds above zero"},
+		{`SET k v EXAT 99999999999`, "(error) time to live is too long (the limit is 100 years)"},
+		{`SET k v EXAT 9223372036854775807`, "(error) time to live is too long (the limit is 100 years)"},
+		{`SET k v EX 10 EXAT ` + sec, "(error) SET takes only one of EX, PX, EXAT, PXAT and KEEPTTL"},
+		{`SET k v PXAT ` + ms + ` KEEPTTL`, "(error) SET takes only one of EX, PX, EXAT, PXAT and KEEPTTL"},
+		{`SET k v GET GET`, "(error) SET takes GET only once"},
+		{`EXPIREAT k 99999999999`, "(error) time to live is too long (the limit is 100 years)"},
+		{`EXPIREAT k soon`, "(error) the time must be a whole number (a Unix time in seconds)"},
+		{`PEXPIREAT k`, "(error) usage: PEXPIREAT <key> <unix-ms>"},
+		{`EXPIRETIME`, "(error) usage: EXPIRETIME <key>"},
+		{`EXISTS k`, "(integer) 0"},
+		{`EXPIREAT sql:schema:t ` + sec, managedErr},
+		{`PEXPIREAT vec:x ` + ms, managedErr},
+		{`SET sql:row:t:1 x GET`, managedErr},
+	}
+	for _, s := range steps {
+		if got := run(t, e, s.in); got != s.want {
+			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
+	}
+
+	// With the real clock: a deadline 30 ms ahead passes.
+	soon := strconv.FormatInt(time.Now().Add(30*time.Millisecond).UnixMilli(), 10)
+	if got := run(t, e, `SET blink x PXAT `+soon); got != "OK" {
+		t.Fatalf("SET blink x PXAT %s = %s", soon, got)
+	}
+	if got := run(t, e, `GET blink`); got != `"x"` {
+		t.Fatalf("GET blink before its deadline = %s", got)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := run(t, e, `GET blink`); got != "(nil)" {
+		t.Fatalf("GET blink after its deadline = %s", got)
 	}
 }

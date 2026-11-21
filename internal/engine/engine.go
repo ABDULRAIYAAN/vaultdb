@@ -6,6 +6,7 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -20,13 +21,17 @@ import (
 const HelpText = `Commands:
   SET <key> <value>   store a value (use "quotes" for spaces)
       [EX <seconds> | PX <ms> | KEEPTTL]  expire it, or keep its current expiry
+      [EXAT <unix-seconds> | PXAT <unix-ms>]  expire it at a set moment
       [NX | XX]                           only if the key is missing / exists
+      [GET]                               reply with the old value instead of OK
   GET <key>           read a value
   DEL <key>           delete a key
   EXISTS <key>        1 if the key exists, 0 if not
   EXPIRE <key> <seconds>     delete the key after this many seconds
   PEXPIRE <key> <ms>         the same, in milliseconds
+  EXPIREAT <key> <unix-seconds>  |  PEXPIREAT <key> <unix-ms>   delete it at a set moment
   TTL <key>  |  PTTL <key>   time left in seconds / ms (-1: no expiry, -2: no key)
+  EXPIRETIME <key>  |  PEXPIRETIME <key>   when it expires, as Unix seconds / ms
   PERSIST <key>              remove the expiry, keep the key
   KEYS                list every key, sorted
   SCAN <from> <to> [limit]   keys from <from> up to (not incl.) <to>;
@@ -115,7 +120,10 @@ func managed(key string) bool {
 
 // writesKey lists the commands that change one key, named by their first
 // argument.
-var writesKey = map[string]bool{"SET": true, "DEL": true, "EXPIRE": true, "PEXPIRE": true, "PERSIST": true}
+var writesKey = map[string]bool{
+	"SET": true, "DEL": true, "PERSIST": true,
+	"EXPIRE": true, "PEXPIRE": true, "EXPIREAT": true, "PEXPIREAT": true,
+}
 
 // Execute runs cmd and returns the text to show the user.
 func (e *Engine) Execute(cmd parser.Command) string {
@@ -132,13 +140,21 @@ func (e *Engine) Execute(cmd parser.Command) string {
 		if len(cmd.Args) < 2 {
 			return usage(setUsage)
 		}
-		opts, err := parseSetOptions(cmd.Args[2:])
+		opts, get, err := parseSetOptions(cmd.Args[2:])
 		if err != nil {
 			return "(error) " + err.Error()
 		}
-		wrote, err := e.store.SetWith(cmd.Args[0], cmd.Args[1], opts)
+		old, existed, wrote, err := e.store.SetWithOld(cmd.Args[0], cmd.Args[1], opts)
 		if err != nil {
 			return "(error) " + err.Error()
+		}
+		if get {
+			// Like Redis: the old value whether or not NX/XX let the write
+			// through, (nil) if there was none.
+			if !existed {
+				return "(nil)"
+			}
+			return strconv.Quote(old)
 		}
 		if !wrote {
 			return "(nil)" // NX or XX said no, like Redis
@@ -200,6 +216,46 @@ func (e *Engine) Execute(cmd parser.Command) string {
 			return "(error) " + err.Error()
 		}
 		return boolInt(ok)
+
+	case "EXPIREAT", "PEXPIREAT":
+		unit, name := "unix-seconds", "a Unix time in seconds"
+		if cmd.Name == "PEXPIREAT" {
+			unit, name = "unix-ms", "a Unix time in milliseconds"
+		}
+		if len(cmd.Args) != 2 {
+			return usage(cmd.Name + " <key> <" + unit + ">")
+		}
+		n, err := strconv.ParseInt(cmd.Args[1], 10, 64)
+		if err != nil {
+			return "(error) the time must be a whole number (" + name + ")"
+		}
+		if n < 0 {
+			n = 0 // long past either way: deletes the key
+		}
+		at, err := unixTime(n, cmd.Name == "EXPIREAT")
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		ok, err := e.store.ExpireAt(cmd.Args[0], at)
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return boolInt(ok)
+
+	case "EXPIRETIME", "PEXPIRETIME":
+		if len(cmd.Args) != 1 {
+			return usage(cmd.Name + " <key>")
+		}
+		at, has, err := e.store.Deadline(cmd.Args[0])
+		switch {
+		case err != nil:
+			return "(integer) -2"
+		case !has:
+			return "(integer) -1"
+		case cmd.Name == "PEXPIRETIME":
+			return fmt.Sprintf("(integer) %d", at.UnixMilli())
+		}
+		return fmt.Sprintf("(integer) %d", at.Unix()) // rounded down, like Redis
 
 	case "TTL", "PTTL":
 		if len(cmd.Args) != 1 {
@@ -325,53 +381,82 @@ func (e *Engine) Execute(cmd parser.Command) string {
 	}
 }
 
-const setUsage = "SET <key> <value> [EX <seconds> | PX <ms> | KEEPTTL] [NX | XX]"
+const setUsage = "SET <key> <value> [EX <seconds> | PX <ms> | EXAT <unix-seconds> | PXAT <unix-ms> | KEEPTTL] [NX | XX] [GET]"
 
 // parseSetOptions reads the words after SET's key and value. They can come
-// in any order and any case, but each group (EX/PX/KEEPTTL, NX/XX) at most
-// once.
-func parseSetOptions(args []string) (store.SetOptions, error) {
-	var o store.SetOptions
+// in any order and any case, but each group (EX/PX/EXAT/PXAT/KEEPTTL, NX/XX,
+// GET) at most once. get reports whether GET was given.
+func parseSetOptions(args []string) (o store.SetOptions, get bool, err error) {
 	expiry, cond := "", ""
 	for i := 0; i < len(args); i++ {
 		word := strings.ToUpper(args[i])
 		switch word {
-		case "EX", "PX", "KEEPTTL":
+		case "EX", "PX", "EXAT", "PXAT", "KEEPTTL":
 			if expiry != "" {
-				return o, fmt.Errorf("SET takes only one of EX, PX and KEEPTTL")
+				return o, false, fmt.Errorf("SET takes only one of EX, PX, EXAT, PXAT and KEEPTTL")
 			}
 			expiry = word
 			if word == "KEEPTTL" {
 				o.KeepTTL = true
 				continue
 			}
-			unit, name := time.Second, "seconds"
-			if word == "PX" {
-				unit, name = time.Millisecond, "milliseconds"
-			}
+			name := map[string]string{
+				"EX": "seconds", "PX": "milliseconds",
+				"EXAT": "Unix seconds", "PXAT": "Unix milliseconds",
+			}[word]
 			if i+1 == len(args) {
-				return o, fmt.Errorf("%s needs a number of %s", word, name)
+				return o, false, fmt.Errorf("%s needs a number of %s", word, name)
 			}
 			i++
 			n, err := strconv.ParseInt(args[i], 10, 64)
 			if err != nil || n <= 0 {
-				return o, fmt.Errorf("%s must be a whole number of %s above zero", word, name)
+				return o, false, fmt.Errorf("%s must be a whole number of %s above zero", word, name)
 			}
-			if n > int64(store.MaxTTL/unit) {
-				return o, store.ErrTTLTooLong
+			switch word {
+			case "EX", "PX":
+				unit := time.Second
+				if word == "PX" {
+					unit = time.Millisecond
+				}
+				if n > int64(store.MaxTTL/unit) {
+					return o, false, store.ErrTTLTooLong
+				}
+				o.TTL = time.Duration(n) * unit
+			default:
+				// How far ahead it is gets checked by the store, against
+				// its own clock.
+				if o.At, err = unixTime(n, word == "EXAT"); err != nil {
+					return o, false, err
+				}
 			}
-			o.TTL = time.Duration(n) * unit
 		case "NX", "XX":
 			if cond != "" {
-				return o, fmt.Errorf("SET takes only one of NX and XX")
+				return o, false, fmt.Errorf("SET takes only one of NX and XX")
 			}
 			cond = word
 			o.IfMissing, o.IfExists = word == "NX", word == "XX"
+		case "GET":
+			if get {
+				return o, false, fmt.Errorf("SET takes GET only once")
+			}
+			get = true
 		default:
-			return o, fmt.Errorf("unknown SET option %q (expected EX, PX, KEEPTTL, NX or XX)", args[i])
+			return o, false, fmt.Errorf("unknown SET option %q (expected EX, PX, EXAT, PXAT, KEEPTTL, NX, XX or GET)", args[i])
 		}
 	}
-	return o, nil
+	return o, get, nil
+}
+
+// unixTime turns n Unix seconds (or milliseconds) into a time, refusing
+// seconds too large to count in milliseconds. n is not negative.
+func unixTime(n int64, seconds bool) (time.Time, error) {
+	if !seconds {
+		return time.UnixMilli(n), nil
+	}
+	if n > math.MaxInt64/1000 {
+		return time.Time{}, store.ErrTTLTooLong
+	}
+	return time.UnixMilli(n * 1000), nil
 }
 
 // vectorCommand runs V... commands. ok is false if cmd is not one of them.

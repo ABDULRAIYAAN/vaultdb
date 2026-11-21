@@ -23,7 +23,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`SET ... EX`, `EXPIRE`, `TTL`, `PERSIST`) whose deadlines survive restarts, with `NX`/`XX` for set-if-missing and set-if-exists, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`SET ... EX`, `EXPIRE`, `TTL`, `PERSIST`, or a set moment with `EXAT` and `EXPIREAT`) whose deadlines survive restarts, with `NX`/`XX` for set-if-missing and set-if-exists and `GET` to swap a value and get the old one back, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -547,12 +547,16 @@ The decoder checks everything it reads (value count, each tag against the column
 | `SET <key> <value>` | Store a value. Use `"quotes"` for values with spaces |
 | `SET <key> <value> EX <seconds>` / `PX <ms>` | Store it and make it expire, in one step that a crash can't split |
 | `SET <key> <value> KEEPTTL` | Replace the value but keep the key's current expiry (a plain `SET` clears it) |
-| `SET <key> <value> NX` / `XX` | Only if the key doesn't exist / already exists. Replies `(nil)` if nothing was written. Combines with `EX`, `PX` or `KEEPTTL`, in any order |
+| `SET <key> <value> EXAT <unix-seconds>` / `PXAT <unix-ms>` | Store it and make it expire at a set moment. A moment that has already passed leaves the key deleted |
+| `SET <key> <value> NX` / `XX` | Only if the key doesn't exist / already exists. Replies `(nil)` if nothing was written. Combines with `EX`, `PX`, `EXAT`, `PXAT` or `KEEPTTL`, in any order |
+| `SET <key> <value> GET` | Store it and reply with the value it replaced, or `(nil)` if there was none. Combines with every other option; with `NX` on an existing key it replies with the value and writes nothing |
 | `GET <key>` | Read a value, or `(nil)` if missing |
 | `DEL <key>` | Delete a key. Returns 1 if it existed, 0 if not |
 | `EXISTS <key>` | 1 if the key exists, 0 if not |
 | `EXPIRE <key> <seconds>` | Delete the key after this many seconds. 1 if the key exists, 0 if not. Zero or less deletes it now |
 | `PEXPIRE <key> <ms>` | The same, in milliseconds |
+| `EXPIREAT <key> <unix-seconds>` / `PEXPIREAT <key> <unix-ms>` | Delete the key at a set moment. A moment that has already passed deletes it now |
+| `EXPIRETIME <key>` / `PEXPIRETIME <key>` | When the key expires, as Unix seconds (rounded down) / milliseconds. -1 if it never expires, -2 if it doesn't exist |
 | `TTL <key>` / `PTTL <key>` | Seconds (rounded up) / milliseconds left. -1 if the key never expires, -2 if it doesn't exist |
 | `PERSIST <key>` | Remove the expiry so the key stays. 1 if there was one to remove |
 | `KEYS` | List every key, sorted |
@@ -647,6 +651,8 @@ vaultdb> TTL session
 
 `NX` and `XX` make `SET` conditional, which together with `EX` is the usual way to take a lock: `SET lock <token> NX EX 30` succeeds for only one client, and the lock frees itself if that client dies. An expired key counts as missing. `KEEPTTL` replaces the value without touching the deadline.
 
+`EXAT`, `PXAT`, `EXPIREAT` and `PEXPIREAT` take the deadline itself instead of a duration, which is handy when it comes from somewhere else (a token's expiry time, the end of a sale). They write exactly the same records as `EX` and `EXPIRE`, since those already store the absolute time. `SET ... GET` swaps a value and hands back the old one in one step, under one lock, so no other client's write can land between reading the old value and writing the new one.
+
 ```
 vaultdb> SET lock worker-1 NX EX 30
 OK
@@ -712,6 +718,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 10c. Secondary indexes (`CREATE INDEX`), so the planner can use columns other than the primary key
 - [x] 11. Expiring keys: `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, with deadlines saved in the log
 - [x] 11b. `SET` options: `EX`/`PX` (value and expiry in one crash-safe record), `KEEPTTL`, `NX`/`XX`
+- [x] 11c. Absolute deadlines (`SET ... EXAT`/`PXAT`, `EXPIREAT`, `PEXPIREAT`, `EXPIRETIME`, `PEXPIRETIME`) and `SET ... GET`
 
 ## Author
 
