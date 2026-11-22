@@ -357,3 +357,70 @@ func TestAbsoluteExpiryAndSetGet(t *testing.T) {
 		t.Fatalf("GET blink after its deadline = %s", got)
 	}
 }
+
+func TestGetDelAndGetEx(t *testing.T) {
+	e := New(store.New())
+	const managedErr = "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
+	at := time.Now().Add(time.Hour).Truncate(time.Second)
+	sec, ms := strconv.FormatInt(at.Unix(), 10), strconv.FormatInt(at.UnixMilli(), 10)
+	steps := []struct{ in, want string }{
+		{`SET code 481516`, "OK"},
+		{`GETDEL code`, `"481516"`},
+		{`GETDEL code`, "(nil)"},
+		{`EXISTS code`, "(integer) 0"},
+		{`getdel missing`, "(nil)"},
+
+		{`SET session abc`, "OK"},
+		{`GETEX session`, `"abc"`},
+		{`TTL session`, "(integer) -1"},
+		{`GETEX session EX 60`, `"abc"`},
+		{`TTL session`, "(integer) 60"},
+		{`GETEX session px 1500`, `"abc"`},
+		{`TTL session`, "(integer) 2"},
+		{`GETEX session EXAT ` + sec, `"abc"`},
+		{`EXPIRETIME session`, "(integer) " + sec},
+		{`GETEX session PXAT ` + ms, `"abc"`},
+		{`PEXPIRETIME session`, "(integer) " + ms},
+		{`GETEX session PERSIST`, `"abc"`},
+		{`TTL session`, "(integer) -1"},
+		{`GETEX session persist`, `"abc"`},
+		{`GETEX session EXAT 1`, `"abc"`}, // already past: read, then gone
+		{`EXISTS session`, "(integer) 0"},
+		{`GETEX session EX 60`, "(nil)"},
+		{`GETEX missing`, "(nil)"},
+
+		{`GETDEL`, "(error) usage: GETDEL <key>"},
+		{`GETDEL a b`, "(error) usage: GETDEL <key>"},
+		{`GETEX`, "(error) usage: GETEX <key> [EX <seconds> | PX <ms> | EXAT <unix-seconds> | PXAT <unix-ms> | PERSIST]"},
+		{`GETEX k EX`, "(error) EX needs a number of seconds"},
+		{`GETEX k PXAT soon`, "(error) PXAT must be a whole number of Unix milliseconds above zero"},
+		{`GETEX k EX 0`, "(error) EX must be a whole number of seconds above zero"},
+		{`GETEX k EX 99999999999`, "(error) time to live is too long (the limit is 100 years)"},
+		{`GETEX k EXAT 9223372036854775807`, "(error) time to live is too long (the limit is 100 years)"},
+		{`GETEX k EX 10 PERSIST`, "(error) GETEX takes only one of EX, PX, EXAT, PXAT and PERSIST"},
+		{`GETEX k PERSIST PERSIST`, "(error) GETEX takes only one of EX, PX, EXAT, PXAT and PERSIST"},
+		{`GETEX k KEEPTTL`, `(error) unknown GETEX option "KEEPTTL" (expected EX, PX, EXAT, PXAT or PERSIST)`},
+
+		// Managed keys: GETDEL and GETEX with an option would change them,
+		// a bare GETEX is only a read.
+		{`GETDEL sql:schema:t`, managedErr},
+		{`GETEX vec:x EX 10`, managedErr},
+		{`GETEX sql:schema:t PERSIST`, managedErr},
+		{`GETEX sql:schema:t`, "(nil)"},
+	}
+	for _, s := range steps {
+		if got := run(t, e, s.in); got != s.want {
+			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
+	}
+
+	// With the real clock: a GETEX PX deadline passes.
+	run(t, e, `SET blink x`)
+	if got := run(t, e, `GETEX blink PX 30`); got != `"x"` {
+		t.Fatalf("GETEX blink PX 30 = %s", got)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := run(t, e, `GET blink`); got != "(nil)" {
+		t.Fatalf("GET blink after its GETEX deadline = %s", got)
+	}
+}

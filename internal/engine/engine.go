@@ -25,6 +25,9 @@ const HelpText = `Commands:
       [NX | XX]                           only if the key is missing / exists
       [GET]                               reply with the old value instead of OK
   GET <key>           read a value
+  GETDEL <key>        read a value and delete the key, in one step
+  GETEX <key> [EX <seconds> | PX <ms> | EXAT <unix-seconds> | PXAT <unix-ms> | PERSIST]
+                      read a value and change its expiry, in one step
   DEL <key>           delete a key
   EXISTS <key>        1 if the key exists, 0 if not
   EXPIRE <key> <seconds>     delete the key after this many seconds
@@ -121,13 +124,15 @@ func managed(key string) bool {
 // writesKey lists the commands that change one key, named by their first
 // argument.
 var writesKey = map[string]bool{
-	"SET": true, "DEL": true, "PERSIST": true,
+	"SET": true, "DEL": true, "PERSIST": true, "GETDEL": true,
 	"EXPIRE": true, "PEXPIRE": true, "EXPIREAT": true, "PEXPIREAT": true,
 }
 
 // Execute runs cmd and returns the text to show the user.
 func (e *Engine) Execute(cmd parser.Command) string {
-	if writesKey[cmd.Name] && len(cmd.Args) > 0 && managed(cmd.Args[0]) {
+	// GETEX only writes when it's given an option; on its own it's a GET.
+	writes := writesKey[cmd.Name] || (cmd.Name == "GETEX" && len(cmd.Args) > 1)
+	if writes && len(cmd.Args) > 0 && managed(cmd.Args[0]) {
 		return "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
 	}
 	if strings.HasPrefix(cmd.Name, "V") {
@@ -168,6 +173,36 @@ func (e *Engine) Execute(cmd parser.Command) string {
 		v, err := e.store.Get(cmd.Args[0])
 		if err != nil {
 			return "(nil)"
+		}
+		return strconv.Quote(v)
+
+	case "GETDEL":
+		if len(cmd.Args) != 1 {
+			return usage("GETDEL <key>")
+		}
+		v, err := e.store.GetDel(cmd.Args[0])
+		switch {
+		case err == store.ErrNotFound:
+			return "(nil)"
+		case err != nil:
+			return "(error) " + err.Error()
+		}
+		return strconv.Quote(v)
+
+	case "GETEX":
+		if len(cmd.Args) < 1 {
+			return usage(getExUsage)
+		}
+		opts, err := parseGetExOptions(cmd.Args[1:])
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		v, err := e.store.GetEx(cmd.Args[0], opts)
+		switch {
+		case err == store.ErrNotFound:
+			return "(nil)"
+		case err != nil:
+			return "(error) " + err.Error()
 		}
 		return strconv.Quote(v)
 
@@ -400,34 +435,12 @@ func parseSetOptions(args []string) (o store.SetOptions, get bool, err error) {
 				o.KeepTTL = true
 				continue
 			}
-			name := map[string]string{
-				"EX": "seconds", "PX": "milliseconds",
-				"EXAT": "Unix seconds", "PXAT": "Unix milliseconds",
-			}[word]
 			if i+1 == len(args) {
-				return o, false, fmt.Errorf("%s needs a number of %s", word, name)
+				return o, false, fmt.Errorf("%s needs a number of %s", word, expiryUnits[word])
 			}
 			i++
-			n, err := strconv.ParseInt(args[i], 10, 64)
-			if err != nil || n <= 0 {
-				return o, false, fmt.Errorf("%s must be a whole number of %s above zero", word, name)
-			}
-			switch word {
-			case "EX", "PX":
-				unit := time.Second
-				if word == "PX" {
-					unit = time.Millisecond
-				}
-				if n > int64(store.MaxTTL/unit) {
-					return o, false, store.ErrTTLTooLong
-				}
-				o.TTL = time.Duration(n) * unit
-			default:
-				// How far ahead it is gets checked by the store, against
-				// its own clock.
-				if o.At, err = unixTime(n, word == "EXAT"); err != nil {
-					return o, false, err
-				}
+			if o.TTL, o.At, err = parseExpiry(word, args[i]); err != nil {
+				return o, false, err
 			}
 		case "NX", "XX":
 			if cond != "" {
@@ -445,6 +458,67 @@ func parseSetOptions(args []string) (o store.SetOptions, get bool, err error) {
 		}
 	}
 	return o, get, nil
+}
+
+// expiryUnits is what the number after each expiry option counts.
+var expiryUnits = map[string]string{
+	"EX": "seconds", "PX": "milliseconds",
+	"EXAT": "Unix seconds", "PXAT": "Unix milliseconds",
+}
+
+// parseExpiry reads the number after EX, PX, EXAT or PXAT (word), for SET
+// and GETEX. EX and PX give a duration, EXAT and PXAT a moment.
+func parseExpiry(word, arg string) (ttl time.Duration, at time.Time, err error) {
+	n, err := strconv.ParseInt(arg, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, at, fmt.Errorf("%s must be a whole number of %s above zero", word, expiryUnits[word])
+	}
+	switch word {
+	case "EX", "PX":
+		unit := time.Second
+		if word == "PX" {
+			unit = time.Millisecond
+		}
+		if n > int64(store.MaxTTL/unit) {
+			return 0, at, store.ErrTTLTooLong
+		}
+		return time.Duration(n) * unit, at, nil
+	}
+	// How far ahead it is gets checked by the store, against its own clock.
+	at, err = unixTime(n, word == "EXAT")
+	return 0, at, err
+}
+
+const getExUsage = "GETEX <key> [EX <seconds> | PX <ms> | EXAT <unix-seconds> | PXAT <unix-ms> | PERSIST]"
+
+// parseGetExOptions reads the words after GETEX's key: at most one of EX,
+// PX, EXAT, PXAT (each with its number) and PERSIST, in any case.
+func parseGetExOptions(args []string) (o store.GetExOptions, err error) {
+	given := false
+	for i := 0; i < len(args); i++ {
+		word := strings.ToUpper(args[i])
+		switch word {
+		case "EX", "PX", "EXAT", "PXAT", "PERSIST":
+		default:
+			return o, fmt.Errorf("unknown GETEX option %q (expected EX, PX, EXAT, PXAT or PERSIST)", args[i])
+		}
+		if given {
+			return o, fmt.Errorf("GETEX takes only one of EX, PX, EXAT, PXAT and PERSIST")
+		}
+		given = true
+		if word == "PERSIST" {
+			o.Persist = true
+			continue
+		}
+		if i+1 == len(args) {
+			return o, fmt.Errorf("%s needs a number of %s", word, expiryUnits[word])
+		}
+		i++
+		if o.TTL, o.At, err = parseExpiry(word, args[i]); err != nil {
+			return o, err
+		}
+	}
+	return o, nil
 }
 
 // unixTime turns n Unix seconds (or milliseconds) into a time, refusing

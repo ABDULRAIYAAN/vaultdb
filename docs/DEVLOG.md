@@ -236,3 +236,22 @@ How it works:
 Tests: `ExpireAt` and `Deadline` on live, missing, expired and plain keys, sub-millisecond rounding, past moments (including with the clock between two milliseconds) and the 100-year limit; `SetWithOld` with `NX`/`XX`, expired keys and past deadlines; a restart test where some absolute deadlines pass while the database is closed; and the random model test from two days ago now also sends `EXAT` (some already past) and `ExpireAt`, checks every old value `SetWithOld` hands back, and checks `Deadline` for every key after every step. Engine tests cover parsing, replies and every error message. I broke it seven ways on purpose (no rounding up, `NX` dropping the old value, an expired key's value counted as old, no 100-year check, `EXPIRETIME` losing the milliseconds, and `EXPIREAT`/`SET EXAT` with "now" not deleting) and each one fails at least one test.
 
 Not done yet: `GETDEL` and `GETEX`, and `EXPIRE`'s `NX`/`XX`/`GT`/`LT` options. The playground is still on the old WebAssembly build.
+
+## 2026-11-22: GETDEL and GETEX
+
+Yesterday's first leftover. `GETDEL key` reads a value and deletes the key in one step. `GETEX key` reads a value and changes its expiry in the same step: `EX`/`PX` for a time from now, `EXAT`/`PXAT` for a set moment, or `PERSIST` to take the expiry off. With no option `GETEX` is just a `GET`. Both reply `(nil)` for a missing key, like Redis. The store side is `GetDel` in `internal/store/store.go` and `GetEx` in `internal/store/ttl.go`.
+
+Why: both are things clients get wrong when they have to do them in two commands. A one-time login code read with `GET` then `DEL` can be used twice if two requests arrive together, since both `GET`s land before either `DEL`. A session that should stay alive while it's being used needs its timeout pushed back on every read, and with `GET` then `EXPIRE` the key can run out in between, so the `EXPIRE` finds nothing and the user gets logged out mid-click.
+
+How it works:
+
+- Both take the write lock, check the key is live (an expired key counts as missing and gets dropped from memory), read the value and then write, so nothing can slip in between. That's what makes `GETDEL` safe for "only one client gets this".
+- No new log records. `GETDEL` writes a `DEL` and `GETEX` an `EXPIRE`, the same records `DEL`, `EXPIRE`, `EXPIREAT` and `PERSIST` already write, so replay and compaction didn't change.
+- They write nothing when there's nothing to change: a missing key, `GETEX` with no option (which only takes the read lock), and `GETEX ... PERSIST` on a key that has no expiry.
+- `GETEX` follows the same rules as `EXPIRE` and `SET ... EX`: under a millisecond rounds up, more than 100 years is refused, and a moment that has already come deletes the key, but the value is still returned, which is what Redis does too.
+- The number parsing for `EX`/`PX`/`EXAT`/`PXAT` moved out of `SET`'s option parser into one shared `parseExpiry`, so `SET` and `GETEX` give exactly the same error messages.
+- `GETDEL` and `GETEX` with an option are refused on `sql:` and `vec:` keys like every other write. A bare `GETEX` is only a read, so it's allowed, same as `GET`.
+
+Tests: `GetDel` on live, missing and expired keys, the log not growing for missing ones, and the delete holding across a restart; a race test where 8 goroutines `GetDel` the same key 200 times and exactly one wins each round; `GetEx` with every option, sub-millisecond rounding, a sliding timeout that keeps a session alive for 40 seconds on a 10-second expiry, past moments (with the clock between two milliseconds), bad option mixes, the 100-year limit, and a restart where the deadline it set comes back with the right time left. The random model test now also sends `GetDel` and `GetEx` with random options and checks every value they return. Engine tests cover the replies and every error message. I broke it seven ways on purpose (`GETDEL` dropping the key without logging a `DEL`, `PERSIST` logging when there's no expiry, a bare `GETEX` writing, rounding down, a past moment not deleting, `PERSIST` doing nothing, and no check that the key is live) and each one fails at least one test.
+
+Not done yet: `EXPIRE`'s `NX`/`XX`/`GT`/`LT` options. The playground is still on the old WebAssembly build.

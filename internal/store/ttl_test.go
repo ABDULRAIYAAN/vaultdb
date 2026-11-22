@@ -279,7 +279,7 @@ func TestExpiryMatchesModel(t *testing.T) {
 				model[k] = n
 				live(k) // drops it if the deadline has already come
 			}
-		case r < 45:
+		case r < 42:
 			k := key()
 			_, want := live(k)
 			got, _ := s.Delete(k)
@@ -287,7 +287,15 @@ func TestExpiryMatchesModel(t *testing.T) {
 				t.Fatalf("step %d: Delete(%s) = %v, want %v", step, k, got, want)
 			}
 			delete(model, k)
-		case r < 70:
+		case r < 45:
+			k := key()
+			e, ok := live(k)
+			v, err := s.GetDel(k)
+			if (err == nil) != ok || v != e.val || (err != nil && err != ErrNotFound) {
+				t.Fatalf("step %d: GetDel(%s) = %q, %v; want %q, %v", step, k, v, err, e.val, ok)
+			}
+			delete(model, k)
+		case r < 66:
 			k := key()
 			d := time.Duration(rng.Intn(5000)-500) * time.Millisecond
 			e, want := live(k)
@@ -306,6 +314,36 @@ func TestExpiryMatchesModel(t *testing.T) {
 			} else if want {
 				e.at = nowMs() + d.Milliseconds()
 				model[k] = e
+			}
+		case r < 72:
+			// GETEX with no option, EX, EXAT (sometimes already past) or
+			// PERSIST, checking the value it reads.
+			k := key()
+			var o GetExOptions
+			switch rng.Intn(4) {
+			case 0:
+				o.TTL = time.Duration(rng.Intn(5000)+1) * time.Millisecond
+			case 1:
+				o.At = time.UnixMilli(nowMs() + int64(rng.Intn(5000)-1000))
+			case 2:
+				o.Persist = true
+			}
+			e, ok := live(k)
+			v, err := s.GetEx(k, o)
+			if (err == nil) != ok || v != e.val || (err != nil && err != ErrNotFound) {
+				t.Fatalf("step %d: GetEx(%s, %+v) = %q, %v; want %q, %v", step, k, o, v, err, e.val, ok)
+			}
+			if ok {
+				switch {
+				case o.TTL > 0:
+					e.at = nowMs() + o.TTL.Milliseconds()
+				case !o.At.IsZero():
+					e.at = o.At.UnixMilli()
+				case o.Persist:
+					e.at = 0
+				}
+				model[k] = e
+				live(k) // drops it if the deadline has already come
 			}
 		case r < 78:
 			k := key()

@@ -25,7 +25,8 @@ import (
 // Removing an expired key from memory is lazy, the way Redis does it. Reads
 // can't change anything (they only hold the read lock), so they just skip
 // expired keys. The memory is freed:
-//   - when a write touches that key (SET, DEL, EXPIRE, PERSIST),
+//   - when a write touches that key (SET, DEL, EXPIRE, PERSIST, GETDEL,
+//     GETEX),
 //   - after every write, by checking up to reapBatch keys that have a
 //     deadline and dropping the expired ones,
 //   - at compaction, which also leaves them out of the new log,
@@ -196,6 +197,74 @@ func (s *Store) Persist(key string) (bool, error) {
 		return false, nil
 	}
 	return true, s.write(aol.Record{Op: aol.OpExpire, Key: key})
+}
+
+// GetExOptions says what GetEx does to the key's expiry. The zero value
+// leaves it alone, which makes GetEx a plain Get.
+type GetExOptions struct {
+	// TTL, if above zero, makes the key expire this long from now (EX, PX).
+	// Under a millisecond rounds up to one.
+	TTL time.Duration
+	// At, if not the zero time, makes the key expire at that moment (EXAT,
+	// PXAT). A moment that has already come deletes the key, after reading
+	// it. Times between two milliseconds round up.
+	At time.Time
+	// Persist removes the key's deadline (PERSIST).
+	Persist bool
+}
+
+// ErrBadGetExOptions is returned by GetEx for options that contradict each
+// other.
+var ErrBadGetExOptions = errors.New("bad GETEX options: a negative TTL, or more than one of TTL, At and Persist")
+
+// GetEx returns key's value and changes its expiry as o says (GETEX), as
+// one step under the write lock. A session read that also pushes its
+// timeout back is the usual use: done as GET then EXPIRE, the key could run
+// out in between and the EXPIRE would find nothing. A missing (or expired)
+// key returns ErrNotFound and writes nothing.
+func (s *Store) GetEx(key string, o GetExOptions) (string, error) {
+	hasAt := !o.At.IsZero()
+	n := 0
+	for _, set := range []bool{o.TTL != 0, hasAt, o.Persist} {
+		if set {
+			n++
+		}
+	}
+	switch {
+	case o.TTL < 0, n > 1:
+		return "", ErrBadGetExOptions
+	case o.TTL > MaxTTL:
+		return "", ErrTTLTooLong
+	case n == 0:
+		return s.Get(key) // changes nothing, so the read lock is enough
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	if hasAt && o.At.Sub(now) > MaxTTL {
+		return "", ErrTTLTooLong
+	}
+	if !s.liveLocked(key) {
+		return "", ErrNotFound
+	}
+	v, _ := s.data.Get(key)
+	var err error
+	switch {
+	case o.TTL > 0:
+		err = s.expireLocked(key, s.nowMs()+ceilMs(o.TTL))
+	case hasAt && !o.At.After(now):
+		err = s.write(aol.Record{Op: aol.OpDelete, Key: key})
+	case hasAt:
+		err = s.expireLocked(key, ceilUnixMs(o.At))
+	case o.Persist:
+		if _, ok := s.expires[key]; ok {
+			err = s.write(aol.Record{Op: aol.OpExpire, Key: key})
+		} // no deadline: nothing to remove, nothing to log
+	}
+	if err != nil {
+		return "", err
+	}
+	return v, nil
 }
 
 // TTL returns how long key has left. hasDeadline is false for a key that

@@ -324,6 +324,23 @@ func (s *Store) Delete(key string) (bool, error) {
 	return true, nil
 }
 
+// GetDel returns key's value and deletes the key (GETDEL), as one step under
+// the write lock, so two callers can never both get the same value. That
+// makes it safe for one-time things like a login code or a job taken off a
+// queue. A missing (or expired) key returns ErrNotFound and writes nothing.
+func (s *Store) GetDel(key string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.liveLocked(key) {
+		return "", ErrNotFound
+	}
+	v, _ := s.data.Get(key)
+	if err := s.write(aol.Record{Op: aol.OpDelete, Key: key}); err != nil {
+		return "", err
+	}
+	return v, nil
+}
+
 // Exists reports whether key is present.
 func (s *Store) Exists(key string) bool {
 	s.mu.RLock()
