@@ -12,9 +12,9 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 | | |
 |---|---|
-| Code | about 9,500 lines of Go, plus 5,250 lines of tests |
-| Tests | 154 tests and 2 fuzz tests, all passing under Go's race detector |
-| Test coverage | 91.1% of the database packages (`internal/`) |
+| Code | about 10,100 lines of Go, plus 6,450 lines of tests |
+| Tests | 172 tests and 2 fuzz tests, all passing under Go's race detector |
+| Test coverage | 91.6% of the database packages (`internal/`) |
 | Dependencies | none: only the Go standard library |
 | Key-value reads | 597 ns per lookup at 100,000 keys, 7.7x faster than SQLite, which in turn wins every SQL query test ([details](#vaultdb-vs-sqlite)) |
 | Durable writes | 161 µs per write with fsync, 1.4x faster than SQLite |
@@ -23,7 +23,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`SET ... EX`, `EXPIRE`, `TTL`, `PERSIST`, or a set moment with `EXAT` and `EXPIREAT`) whose deadlines survive restarts, with `NX`/`XX` for set-if-missing and set-if-exists, `GET` to swap a value and get the old one back, and `GETDEL`/`GETEX` to read a key and delete it or change its expiry in one step, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`SET ... EX`, `EXPIRE`, `TTL`, `PERSIST`, or a set moment with `EXAT` and `EXPIREAT`) whose deadlines survive restarts, with `NX`/`XX` for set-if-missing and set-if-exists, `NX`/`XX`/`GT`/`LT` on `EXPIRE` to only add, replace, extend or shorten an expiry, `GET` to swap a value and get the old one back, and `GETDEL`/`GETEX` to read a key and delete it or change its expiry in one step, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -558,6 +558,7 @@ The decoder checks everything it reads (value count, each tag against the column
 | `EXPIRE <key> <seconds>` | Delete the key after this many seconds. 1 if the key exists, 0 if not. Zero or less deletes it now |
 | `PEXPIRE <key> <ms>` | The same, in milliseconds |
 | `EXPIREAT <key> <unix-seconds>` / `PEXPIREAT <key> <unix-ms>` | Delete the key at a set moment. A moment that has already passed deletes it now |
+| `EXPIRE ... [NX \| XX \| GT \| LT]` | Any of the four `EXPIRE` commands, only if the key has no expiry (`NX`), already has one (`XX`), or the new one is later (`GT`) or sooner (`LT`). No expiry counts as never, so `GT` never applies to it and `LT` always does. `XX` goes with `GT` or `LT`. 0 when a condition says no |
 | `EXPIRETIME <key>` / `PEXPIRETIME <key>` | When the key expires, as Unix seconds (rounded down) / milliseconds. -1 if it never expires, -2 if it doesn't exist |
 | `TTL <key>` / `PTTL <key>` | Seconds (rounded up) / milliseconds left. -1 if the key never expires, -2 if it doesn't exist |
 | `PERSIST <key>` | Remove the expiry so the key stays. 1 if there was one to remove |
@@ -657,6 +658,8 @@ vaultdb> TTL session
 
 `GETDEL` and `GETEX` are the read-side versions of the same idea. `GETDEL` reads and deletes under one lock, so a one-time login code or a job taken off a queue goes to exactly one client, never two. `GETEX` reads and changes the expiry in one step, which is how a sliding session timeout works: every read pushes the deadline back, and there is no gap where the key could run out between a `GET` and an `EXPIRE`. Neither needs a new log record: `GETDEL` writes a `DEL` and `GETEX` an `EXPIRE` (or nothing, when there is nothing to change).
 
+`NX`, `XX`, `GT` and `LT` on `EXPIRE` (and `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`) make the expiry itself conditional, checked under the same lock as the write. `EXPIRE session 1800 GT` pushes a session's deadline back but never pulls it in, so two requests racing to extend it can't leave it shorter than either asked for. `EXPIRE cache 60 LT` caps how long something can live without ever lengthening it. `NX` gives an expiry only to keys that don't have one yet. A key with no expiry counts as living forever, so `GT` never applies to it and `LT` always does, the same as Redis. When a condition says no, nothing is written.
+
 ```
 vaultdb> SET lock worker-1 NX EX 30
 OK
@@ -724,6 +727,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 11b. `SET` options: `EX`/`PX` (value and expiry in one crash-safe record), `KEEPTTL`, `NX`/`XX`
 - [x] 11c. Absolute deadlines (`SET ... EXAT`/`PXAT`, `EXPIREAT`, `PEXPIREAT`, `EXPIRETIME`, `PEXPIRETIME`) and `SET ... GET`
 - [x] 11d. `GETDEL` and `GETEX`: read a key and delete it, or change its expiry, in one step
+- [x] 11e. `EXPIRE` options `NX`, `XX`, `GT`, `LT`: only add, replace, extend or shorten an expiry
 
 ## Author
 

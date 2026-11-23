@@ -207,7 +207,7 @@ func TestDeadlinesSurviveRestart(t *testing.T) {
 }
 
 // TestExpiryMatchesModel runs random writes (plain and with SET options),
-// expiries, clock jumps, compactions and restarts, and checks the store
+// expiries (plain and with NX/XX/GT/LT), clock jumps, compactions and restarts, and checks the store
 // against a plain map after every step. After each compaction the log has to weigh exactly what
 // liveBytes said it would, which checks the size bookkeeping too.
 func TestExpiryMatchesModel(t *testing.T) {
@@ -296,23 +296,39 @@ func TestExpiryMatchesModel(t *testing.T) {
 			}
 			delete(model, k)
 		case r < 66:
+			// EXPIRE or EXPIREAT, half the time with a random valid mix
+			// of NX, XX, GT and LT.
 			k := key()
 			d := time.Duration(rng.Intn(5000)-500) * time.Millisecond
+			var o ExpireOptions
+			if rng.Intn(2) == 0 {
+				o = []ExpireOptions{
+					{IfNoDeadline: true}, {IfHasDeadline: true}, {IfLater: true}, {IfSooner: true},
+					{IfHasDeadline: true, IfLater: true}, {IfHasDeadline: true, IfSooner: true},
+				}[rng.Intn(6)]
+			}
 			e, want := live(k)
+			newAt := nowMs() // already come
+			if d > 0 {
+				newAt += d.Milliseconds()
+			}
+			has := e.at != 0
+			want = want && !(o.IfNoDeadline && has) && !(o.IfHasDeadline && !has) &&
+				!(o.IfLater && (!has || newAt <= e.at)) && !(o.IfSooner && has && newAt >= e.at)
 			var got bool
 			var err error
 			if rng.Intn(2) == 0 {
-				got, err = s.Expire(k, d)
+				got, err = s.ExpireWith(k, d, o)
 			} else {
-				got, err = s.ExpireAt(k, time.UnixMilli(nowMs()+d.Milliseconds()))
+				got, err = s.ExpireAtWith(k, time.UnixMilli(nowMs()+d.Milliseconds()), o)
 			}
 			if err != nil || got != want {
-				t.Fatalf("step %d: Expire(%s, %v) = %v, %v; want %v", step, k, d, got, err, want)
+				t.Fatalf("step %d: Expire(%s, %v, %+v) = %v, %v; want %v", step, k, d, o, got, err, want)
 			}
 			if want && d <= 0 {
 				delete(model, k)
 			} else if want {
-				e.at = nowMs() + d.Milliseconds()
+				e.at = newAt
 				model[k] = e
 			}
 		case r < 72:

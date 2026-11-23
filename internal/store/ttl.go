@@ -55,6 +55,54 @@ const reapBatch = 20
 // reports whether the key exists. A d of zero or less deletes the key
 // straight away. Durations under a millisecond round up to one.
 func (s *Store) Expire(key string, d time.Duration) (bool, error) {
+	return s.ExpireWith(key, d, ExpireOptions{})
+}
+
+// ExpireAt is Expire with an absolute deadline (EXPIREAT, PEXPIREAT). A
+// moment that has already come deletes the key straight away, and one more
+// than MaxTTL away is refused. Times between two milliseconds round up.
+func (s *Store) ExpireAt(key string, at time.Time) (bool, error) {
+	return s.ExpireAtWith(key, at, ExpireOptions{})
+}
+
+// ExpireOptions are the conditions EXPIRE can take (NX, XX, GT, LT). The
+// zero value always sets the deadline.
+type ExpireOptions struct {
+	// IfNoDeadline only sets a deadline on a key that has none (NX), and
+	// IfHasDeadline only on a key that already has one (XX).
+	IfNoDeadline, IfHasDeadline bool
+	// IfLater only moves the deadline later (GT), and IfSooner only
+	// sooner (LT). A key with no deadline counts as never expiring, so
+	// IfLater never applies to it and IfSooner always does. Both compare
+	// whole milliseconds, after rounding, and an equal deadline is neither
+	// later nor sooner.
+	IfLater, IfSooner bool
+}
+
+// ErrBadExpireOptions is returned by ExpireWith and ExpireAtWith for
+// options that contradict each other.
+var ErrBadExpireOptions = errors.New("bad EXPIRE options: IfNoDeadline with IfHasDeadline, IfLater or IfSooner, or IfLater with IfSooner")
+
+func (o ExpireOptions) check() error {
+	if o.IfNoDeadline && (o.IfHasDeadline || o.IfLater || o.IfSooner) || o.IfLater && o.IfSooner {
+		return ErrBadExpireOptions
+	}
+	return nil
+}
+
+// ExpireWith is Expire that only goes ahead when o's conditions hold. It
+// reports whether it did (the key's deadline changed, or the key was
+// deleted because d was zero or less), so false means the key is missing
+// or a condition said no, and nothing was written.
+//
+// The conditions are checked against the new deadline before deciding
+// whether it has already come, the way Redis does it: a d of zero or less
+// counts as a deadline sooner than any the key could have, so it passes
+// IfSooner and fails IfLater.
+func (s *Store) ExpireWith(key string, d time.Duration, o ExpireOptions) (bool, error) {
+	if err := o.check(); err != nil {
+		return false, err
+	}
 	if d > MaxTTL {
 		return false, ErrTTLTooLong
 	}
@@ -63,16 +111,21 @@ func (s *Store) Expire(key string, d time.Duration) (bool, error) {
 	if !s.liveLocked(key) {
 		return false, nil
 	}
-	if d <= 0 {
-		return true, s.write(aol.Record{Op: aol.OpDelete, Key: key})
+	now := s.nowMs()
+	at := now // already come
+	if d > 0 {
+		at = now + ceilMs(d)
 	}
-	return true, s.expireLocked(key, s.nowMs()+ceilMs(d))
+	return s.setDeadlineLocked(key, at, now, o)
 }
 
-// ExpireAt is Expire with an absolute deadline (EXPIREAT, PEXPIREAT). A
-// moment that has already come deletes the key straight away, and one more
-// than MaxTTL away is refused. Times between two milliseconds round up.
-func (s *Store) ExpireAt(key string, at time.Time) (bool, error) {
+// ExpireAtWith is ExpireAt that only goes ahead when o's conditions hold,
+// like ExpireWith. A moment that has already come passes IfSooner, fails
+// IfLater, and deletes the key if it does go ahead.
+func (s *Store) ExpireAtWith(key string, at time.Time, o ExpireOptions) (bool, error) {
+	if err := o.check(); err != nil {
+		return false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
@@ -82,10 +135,31 @@ func (s *Store) ExpireAt(key string, at time.Time) (bool, error) {
 	if !s.liveLocked(key) {
 		return false, nil
 	}
-	if !at.After(now) {
+	nowMs := now.UnixMilli()
+	ms := nowMs // already come. Checked on the full time, before rounding up.
+	if at.After(now) {
+		ms = ceilUnixMs(at)
+	}
+	return s.setDeadlineLocked(key, ms, nowMs, o)
+}
+
+// setDeadlineLocked gives the live key the deadline at (Unix ms) if o's
+// conditions allow it, deleting the key if at is not after now. Caller
+// holds the write lock.
+func (s *Store) setDeadlineLocked(key string, at, now int64, o ExpireOptions) (bool, error) {
+	cur, has := s.expires[key] // cur > now, since the key is live
+	switch {
+	case o.IfNoDeadline && has, o.IfHasDeadline && !has:
+		return false, nil
+	case o.IfLater && (!has || at <= cur): // no deadline is later than any
+		return false, nil
+	case o.IfSooner && has && at >= cur:
+		return false, nil
+	}
+	if at <= now {
 		return true, s.write(aol.Record{Op: aol.OpDelete, Key: key})
 	}
-	return true, s.expireLocked(key, ceilUnixMs(at))
+	return true, s.expireLocked(key, at)
 }
 
 // expireLocked writes key's new deadline. The key is live and the deadline

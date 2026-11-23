@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -188,8 +189,8 @@ func TestExpiryCommands(t *testing.T) {
 		{`SET k v`, "OK"},
 		{`EXPIRE k -5`, "(integer) 1"},
 		{`EXISTS k`, "(integer) 0"},
-		{`EXPIRE k`, "(error) usage: EXPIRE <key> <seconds>"},
-		{`PEXPIRE k`, "(error) usage: PEXPIRE <key> <milliseconds>"},
+		{`EXPIRE k`, "(error) usage: EXPIRE <key> <seconds> [NX | XX | GT | LT]"},
+		{`PEXPIRE k`, "(error) usage: PEXPIRE <key> <milliseconds> [NX | XX | GT | LT]"},
 		{`TTL`, "(error) usage: TTL <key>"},
 		{`PERSIST`, "(error) usage: PERSIST <key>"},
 		{`EXPIRE k soon`, "(error) seconds must be a whole number"},
@@ -331,7 +332,7 @@ func TestAbsoluteExpiryAndSetGet(t *testing.T) {
 		{`SET k v GET GET`, "(error) SET takes GET only once"},
 		{`EXPIREAT k 99999999999`, "(error) time to live is too long (the limit is 100 years)"},
 		{`EXPIREAT k soon`, "(error) the time must be a whole number (a Unix time in seconds)"},
-		{`PEXPIREAT k`, "(error) usage: PEXPIREAT <key> <unix-ms>"},
+		{`PEXPIREAT k`, "(error) usage: PEXPIREAT <key> <unix-ms> [NX | XX | GT | LT]"},
 		{`EXPIRETIME`, "(error) usage: EXPIRETIME <key>"},
 		{`EXISTS k`, "(integer) 0"},
 		{`EXPIREAT sql:schema:t ` + sec, managedErr},
@@ -422,5 +423,68 @@ func TestGetDelAndGetEx(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if got := run(t, e, `GET blink`); got != "(nil)" {
 		t.Fatalf("GET blink after its GETEX deadline = %s", got)
+	}
+}
+
+func TestExpireOptions(t *testing.T) {
+	// A clock that stands still, so "the same deadline" really is the same
+	// millisecond from one command to the next.
+	now := time.Now().Truncate(time.Second)
+	s, _, err := store.Open(filepath.Join(t.TempDir(), "opts.log"), store.Options{Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	e := New(s)
+	const managedErr = "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
+	later := now.Add(time.Hour)
+	sec := strconv.FormatInt(later.Unix(), 10)
+	steps := []struct{ in, want string }{
+		{`SET k v`, "OK"},
+		{`EXPIRE k 100 XX`, "(integer) 0"}, // no expiry yet
+		{`TTL k`, "(integer) -1"},
+		{`EXPIRE k 100 GT`, "(integer) 0"}, // no expiry is "never", nothing is later
+		{`EXPIRE k 100 NX`, "(integer) 1"},
+		{`TTL k`, "(integer) 100"},
+		{`EXPIRE k 50 NX`, "(integer) 0"},
+		{`EXPIRE k 50 gt`, "(integer) 0"},
+		{`EXPIRE k 100 GT`, "(integer) 0"}, // equal is not later
+		{`EXPIRE k 200 GT`, "(integer) 1"},
+		{`TTL k`, "(integer) 200"},
+		{`EXPIRE k 300 LT`, "(integer) 0"},
+		{`EXPIRE k 150 lt xx`, "(integer) 1"},
+		{`TTL k`, "(integer) 150"},
+		{`PEXPIRE k 140000 XX LT`, "(integer) 1"},
+		{`PTTL k`, "(integer) 140000"},
+		{`EXPIREAT k ` + sec + ` GT`, "(integer) 1"},
+		{`EXPIRETIME k`, "(integer) " + sec},
+		{`PEXPIREAT k 1 GT`, "(integer) 0"}, // the past is never later
+		{`EXISTS k`, "(integer) 1"},
+		{`PEXPIREAT k 1 LT`, "(integer) 1"}, // but always sooner: deletes it
+		{`EXISTS k`, "(integer) 0"},
+		{`EXPIRE k 100 LT`, "(integer) 0"}, // missing key
+
+		{`SET p v`, "OK"},
+		{`EXPIRE p 100 LT`, "(integer) 1"}, // anything is sooner than never
+		{`TTL p`, "(integer) 100"},
+		{`PERSIST p`, "(integer) 1"},
+		{`EXPIRE p 0 NX`, "(integer) 1"},
+		{`EXISTS p`, "(integer) 0"},
+
+		{`EXPIRE k 10 NX XX`, "(error) NX can't be used with XX, GT or LT"},
+		{`EXPIRE k 10 GT NX`, "(error) NX can't be used with XX, GT or LT"},
+		{`PEXPIREAT k 10 nx lt`, "(error) NX can't be used with XX, GT or LT"},
+		{`EXPIRE k 10 GT LT`, "(error) GT and LT can't be used together"},
+		{`EXPIRE k 10 XX XX`, "(error) EXPIRE takes XX only once"},
+		{`EXPIREAT k 10 KEEPTTL`, `(error) unknown EXPIREAT option "KEEPTTL" (expected NX, XX, GT or LT)`},
+		{`EXPIRE k soon NX`, "(error) seconds must be a whole number"},
+		{`EXPIRE k 99999999999 GT`, "(error) time to live is too long (the limit is 100 years)"},
+		{`EXPIREAT`, "(error) usage: EXPIREAT <key> <unix-seconds> [NX | XX | GT | LT]"},
+		{`EXPIRE sql:schema:t 10 LT`, managedErr},
+	}
+	for _, s := range steps {
+		if got := run(t, e, s.in); got != s.want {
+			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
 	}
 }

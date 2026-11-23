@@ -255,3 +255,24 @@ How it works:
 Tests: `GetDel` on live, missing and expired keys, the log not growing for missing ones, and the delete holding across a restart; a race test where 8 goroutines `GetDel` the same key 200 times and exactly one wins each round; `GetEx` with every option, sub-millisecond rounding, a sliding timeout that keeps a session alive for 40 seconds on a 10-second expiry, past moments (with the clock between two milliseconds), bad option mixes, the 100-year limit, and a restart where the deadline it set comes back with the right time left. The random model test now also sends `GetDel` and `GetEx` with random options and checks every value they return. Engine tests cover the replies and every error message. I broke it seven ways on purpose (`GETDEL` dropping the key without logging a `DEL`, `PERSIST` logging when there's no expiry, a bare `GETEX` writing, rounding down, a past moment not deleting, `PERSIST` doing nothing, and no check that the key is live) and each one fails at least one test.
 
 Not done yet: `EXPIRE`'s `NX`/`XX`/`GT`/`LT` options. The playground is still on the old WebAssembly build.
+
+## 2026-11-23: EXPIRE options (NX, XX, GT, LT)
+
+Yesterday's leftover. `EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT` now take `NX` (only if the key has no expiry), `XX` (only if it has one), `GT` (only if the new deadline is later) and `LT` (only if it's sooner). They reply `0` when a condition says no, like Redis 7. The store side is `ExpireWith` and `ExpireAtWith` in `internal/store/ttl.go`; plain `Expire` and `ExpireAt` now just call them with no conditions.
+
+Why: the common case is a session or cache entry that several requests touch at once. Each one wants to push the deadline back, and with a plain `EXPIRE` a slow request carrying a shorter timeout can land last and pull it in again. `EXPIRE session 1800 GT` only ever moves it later, so the order requests arrive in stops mattering. `LT` is the opposite, a cap that can only tighten, and `NX` hands out a default expiry without overwriting one somebody already set. Checking the current deadline from the client and then calling `EXPIRE` is the same read-then-write race that `GETEX` fixed for reads.
+
+How it works:
+
+- No new log records. When the conditions pass it writes the same `EXPIRE` (or `DEL`) as before, and when they don't it writes nothing, so replay and compaction didn't change.
+- The check and the write happen under the write lock, after the key has been checked as live. An expired key still counts as missing, so even `LT` replies `0` for it.
+- A key with no expiry counts as living forever. So `GT` never applies to it (nothing is later than never) and `LT` always does. This is what Redis does, and it's what makes `LT` a real cap.
+- The conditions are checked against the new deadline *before* deciding whether it has already passed, again like Redis. A zero, negative or past deadline counts as sooner than anything, so `EXPIRE k 0 LT` deletes the key and `EXPIRE k 0 GT` leaves it alone.
+- Comparisons are in whole milliseconds after rounding up, and equal is neither later nor sooner. So `EXPIRE k 10 GT` on a key with exactly 10 seconds left is a `0`, even if the new one was a few microseconds longer before rounding.
+- `XX` goes with `GT` or `LT`. `NX` with anything else, and `GT` with `LT`, are refused with an error, the same rules as Redis. Options can be in any case and order, each at most once.
+
+Tests: a table that runs every option and mix against a key with no expiry and a key with 10 seconds left, with a new deadline that's sooner, equal, later, equal only after rounding, or already past, through both `ExpireWith` and `ExpireAtWith`; refused conditions not growing the log; bad mixes; the 100-year limit; expired keys; and a `GT` deadline coming back after a restart. The random model test from four days ago now sends random valid option mixes half the time and works out the expected answer on its own. Engine tests use a clock that stands still, so "the same deadline" is really the same millisecond between commands. I broke it seven ways on purpose (`<` instead of `<=` for `GT` and for `LT`, `GT` applying to keys with no expiry, `LT` refusing them, `XX` ignored, a past `EXPIREAT` treated as future, and `GT` with `LT` accepted) and each one fails at least one test.
+
+Also updated the numbers at the top of the README, which had fallen behind since the 19th: 172 tests now, 91.6% coverage.
+
+Not done yet: the playground is still on the old WebAssembly build, so none of the expiry commands from this week are on the site until I rebuild it.

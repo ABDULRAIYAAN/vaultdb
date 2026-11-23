@@ -33,6 +33,8 @@ const HelpText = `Commands:
   EXPIRE <key> <seconds>     delete the key after this many seconds
   PEXPIRE <key> <ms>         the same, in milliseconds
   EXPIREAT <key> <unix-seconds>  |  PEXPIREAT <key> <unix-ms>   delete it at a set moment
+      [NX | XX | GT | LT]    only if it has no expiry / has one /
+                             the new one is later / sooner
   TTL <key>  |  PTTL <key>   time left in seconds / ms (-1: no expiry, -2: no key)
   EXPIRETIME <key>  |  PEXPIRETIME <key>   when it expires, as Unix seconds / ms
   PERSIST <key>              remove the expiry, keep the key
@@ -233,12 +235,16 @@ func (e *Engine) Execute(cmd parser.Command) string {
 		if cmd.Name == "PEXPIRE" {
 			unit, name = time.Millisecond, "milliseconds"
 		}
-		if len(cmd.Args) != 2 {
-			return usage(cmd.Name + " <key> <" + name + ">")
+		if len(cmd.Args) < 2 {
+			return usage(cmd.Name + " <key> <" + name + "> " + expireOptionsUsage)
 		}
 		n, err := strconv.ParseInt(cmd.Args[1], 10, 64)
 		if err != nil {
 			return "(error) " + name + " must be a whole number"
+		}
+		opts, err := parseExpireOptions(cmd.Name, cmd.Args[2:])
+		if err != nil {
+			return "(error) " + err.Error()
 		}
 		if n > int64(store.MaxTTL/unit) {
 			return "(error) " + store.ErrTTLTooLong.Error()
@@ -246,7 +252,7 @@ func (e *Engine) Execute(cmd parser.Command) string {
 		if n < 0 {
 			n = 0 // also deletes; avoids overflow for huge negative numbers
 		}
-		ok, err := e.store.Expire(cmd.Args[0], time.Duration(n)*unit)
+		ok, err := e.store.ExpireWith(cmd.Args[0], time.Duration(n)*unit, opts)
 		if err != nil {
 			return "(error) " + err.Error()
 		}
@@ -257,12 +263,16 @@ func (e *Engine) Execute(cmd parser.Command) string {
 		if cmd.Name == "PEXPIREAT" {
 			unit, name = "unix-ms", "a Unix time in milliseconds"
 		}
-		if len(cmd.Args) != 2 {
-			return usage(cmd.Name + " <key> <" + unit + ">")
+		if len(cmd.Args) < 2 {
+			return usage(cmd.Name + " <key> <" + unit + "> " + expireOptionsUsage)
 		}
 		n, err := strconv.ParseInt(cmd.Args[1], 10, 64)
 		if err != nil {
 			return "(error) the time must be a whole number (" + name + ")"
+		}
+		opts, err := parseExpireOptions(cmd.Name, cmd.Args[2:])
+		if err != nil {
+			return "(error) " + err.Error()
 		}
 		if n < 0 {
 			n = 0 // long past either way: deletes the key
@@ -271,7 +281,7 @@ func (e *Engine) Execute(cmd parser.Command) string {
 		if err != nil {
 			return "(error) " + err.Error()
 		}
-		ok, err := e.store.ExpireAt(cmd.Args[0], at)
+		ok, err := e.store.ExpireAtWith(cmd.Args[0], at, opts)
 		if err != nil {
 			return "(error) " + err.Error()
 		}
@@ -518,6 +528,37 @@ func parseGetExOptions(args []string) (o store.GetExOptions, err error) {
 			return o, err
 		}
 	}
+	return o, nil
+}
+
+const expireOptionsUsage = "[NX | XX | GT | LT]"
+
+// parseExpireOptions reads the words after EXPIRE's (or PEXPIRE's,
+// EXPIREAT's, PEXPIREAT's) key and number: NX, XX, GT and LT in any case,
+// each at most once. XX goes with GT or LT, but NX goes with nothing else
+// and GT not with LT, the same rules as Redis.
+func parseExpireOptions(name string, args []string) (o store.ExpireOptions, err error) {
+	seen := map[string]bool{}
+	for _, a := range args {
+		word := strings.ToUpper(a)
+		switch word {
+		case "NX", "XX", "GT", "LT":
+		default:
+			return o, fmt.Errorf("unknown %s option %q (expected NX, XX, GT or LT)", name, a)
+		}
+		if seen[word] {
+			return o, fmt.Errorf("%s takes %s only once", name, word)
+		}
+		seen[word] = true
+	}
+	switch {
+	case seen["NX"] && (seen["XX"] || seen["GT"] || seen["LT"]):
+		return o, fmt.Errorf("NX can't be used with XX, GT or LT")
+	case seen["GT"] && seen["LT"]:
+		return o, fmt.Errorf("GT and LT can't be used together")
+	}
+	o.IfNoDeadline, o.IfHasDeadline = seen["NX"], seen["XX"]
+	o.IfLater, o.IfSooner = seen["GT"], seen["LT"]
 	return o, nil
 }
 
