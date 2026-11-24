@@ -29,6 +29,8 @@ const HelpText = `Commands:
   GETEX <key> [EX <seconds> | PX <ms> | EXAT <unix-seconds> | PXAT <unix-ms> | PERSIST]
                       read a value and change its expiry, in one step
   DEL <key>           delete a key
+  INCR <key>  |  DECR <key>  add / take away 1 (a missing key starts at 0)
+  INCRBY <key> <n>  |  DECRBY <key> <n>   add / take away n
   EXISTS <key>        1 if the key exists, 0 if not
   EXPIRE <key> <seconds>     delete the key after this many seconds
   PEXPIRE <key> <ms>         the same, in milliseconds
@@ -127,6 +129,7 @@ func managed(key string) bool {
 // argument.
 var writesKey = map[string]bool{
 	"SET": true, "DEL": true, "PERSIST": true, "GETDEL": true,
+	"INCR": true, "DECR": true, "INCRBY": true, "DECRBY": true,
 	"EXPIRE": true, "PEXPIRE": true, "EXPIREAT": true, "PEXPIREAT": true,
 }
 
@@ -220,6 +223,34 @@ func (e *Engine) Execute(cmd parser.Command) string {
 			return "(integer) 1"
 		}
 		return "(integer) 0"
+
+	case "INCR", "DECR", "INCRBY", "DECRBY":
+		by := cmd.Name == "INCRBY" || cmd.Name == "DECRBY"
+		if by && len(cmd.Args) != 2 {
+			return usage(cmd.Name + " <key> <n>")
+		}
+		if !by && len(cmd.Args) != 1 {
+			return usage(cmd.Name + " <key>")
+		}
+		delta := int64(1)
+		if by {
+			n, err := strconv.ParseInt(cmd.Args[1], 10, 64)
+			if err != nil {
+				return "(error) the amount must be a whole number that fits in 64 bits"
+			}
+			delta = n
+		}
+		if strings.HasPrefix(cmd.Name, "DECR") {
+			if delta == math.MinInt64 {
+				return "(error) " + store.ErrOverflow.Error() // -delta doesn't fit
+			}
+			delta = -delta
+		}
+		n, err := e.store.IncrBy(cmd.Args[0], delta)
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return fmt.Sprintf("(integer) %d", n)
 
 	case "EXISTS":
 		if len(cmd.Args) != 1 {

@@ -26,7 +26,7 @@ import (
 // can't change anything (they only hold the read lock), so they just skip
 // expired keys. The memory is freed:
 //   - when a write touches that key (SET, DEL, EXPIRE, PERSIST, GETDEL,
-//     GETEX),
+//     GETEX, INCR),
 //   - after every write, by checking up to reapBatch keys that have a
 //     deadline and dropping the expired ones,
 //   - at compaction, which also leaves them out of the new log,

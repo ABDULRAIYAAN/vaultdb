@@ -2,10 +2,12 @@ package store
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 
@@ -372,6 +374,30 @@ func TestExpiryMatchesModel(t *testing.T) {
 				e.at = 0
 				model[k] = e
 			}
+		case r < 83:
+			// INCRBY: a small step most of the time, sometimes one big
+			// enough to overflow. The deadline must be kept.
+			k := key()
+			delta := int64(rng.Intn(21) - 10)
+			if rng.Intn(10) == 0 {
+				delta = math.MaxInt64
+			}
+			e, ok := live(k)
+			var cur int64
+			if ok {
+				cur, _ = strconv.ParseInt(e.val, 10, 64) // every value here is a number
+			}
+			got, err := s.IncrBy(k, delta)
+			if delta > 0 && cur > math.MaxInt64-delta {
+				if err != ErrOverflow {
+					t.Fatalf("step %d: IncrBy(%s, %d) on %d: err = %v, want ErrOverflow", step, k, delta, cur, err)
+				}
+				break
+			}
+			if err != nil || got != cur+delta {
+				t.Fatalf("step %d: IncrBy(%s, %d) on %d = %d, %v", step, k, delta, cur, got, err)
+			}
+			model[k] = entry{val: strconv.FormatInt(got, 10), at: e.at}
 		case r < 93:
 			c.advance(time.Duration(rng.Intn(1500)) * time.Millisecond)
 		case r < 97:

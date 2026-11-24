@@ -276,3 +276,23 @@ Tests: a table that runs every option and mix against a key with no expiry and a
 Also updated the numbers at the top of the README, which had fallen behind since the 19th: 172 tests now, 91.6% coverage.
 
 Not done yet: the playground is still on the old WebAssembly build, so none of the expiry commands from this week are on the site until I rebuild it.
+
+## 2026-11-24: Atomic counters (INCR, DECR, INCRBY, DECRBY)
+
+The expiry work is done, so today's a new small feature: counters. `INCR key` adds 1 to the number stored at a key and replies with the new value, `DECR` takes 1 away, and `INCRBY` / `DECRBY` add or take away any whole number. A missing key starts at 0. The store side is `IncrBy` in the new `internal/store/counter.go`; the four commands all call it (`DECRBY` just flips the sign).
+
+Why: counting is one of the most common things people use a key-value store for (page views, likes, stock left, retries, rate limits), and it's easy to get wrong from a client. `GET views`, add one, `SET views` loses updates as soon as two clients do it at once: both read 41, both write 42. `INCR` does the read, the add and the write under the write lock, so they can't be split.
+
+How it works:
+
+- The value is still a plain string. Only the exact form `strconv.FormatInt` would write counts as a number, so `42` and `-7` do, but `+42`, `042`, `-0`, ` 42` and `4.2` are refused with `value is not an integer or out of range`. That keeps what's read and what's written back in the same form, and it's what Redis accepts too.
+- A result that wouldn't fit in 64 bits is refused with `increment or decrement would overflow`, checked before adding so the sum itself can never wrap round. `DECRBY key -9223372036854775808` is refused in the engine, since flipping its sign doesn't fit either. Anything refused writes nothing.
+- The key's expiry is kept, like Redis. That's what makes a rate limiter work: `INCR` a per-user key and give it a window with `EXPIRE ... NX` the first time, and the count resets on its own when the window ends. With an expiry, the new value goes to the log as one `SETEX` with the same deadline (the same trick as `SET ... KEEPTTL`), so a crash can't keep the count but lose the window. Without one it's a plain `SET`. No new log record types.
+- An expired key counts as missing, so a counter whose window has passed starts again from 0 with no expiry.
+- `INCR` and friends are refused on `sql:` and `vec:` keys like every other write.
+
+Tests: `IncrBy` on missing keys, negative steps, every accepted and refused value form, overflow both ways right at the edge, the deadline being kept and coming back after a restart and after compaction then a restart, a counter starting over once its window passes, and refused increments not growing the log. A race test has 8 goroutines adding 500 times each and checks nothing was lost, before and after a restart. The random model test now also sends `IncrBy` with small steps and the odd overflowing one, checking every result and that the deadline stays. Engine tests cover all four commands, their replies and every error message. I broke it four ways on purpose (dropping the deadline, no overflow check, accepting `+5`/`05`-style values, and reading expired values as live) and each one fails at least one test.
+
+Updated the README numbers too: 176 tests, 91.7% coverage.
+
+Not done yet: `INCRBYFLOAT` for decimal counters. The playground is still on the old WebAssembly build.

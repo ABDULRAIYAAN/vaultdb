@@ -488,3 +488,54 @@ func TestExpireOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestCounters(t *testing.T) {
+	e := New(store.New())
+	const managedErr = "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
+	steps := []struct{ in, want string }{
+		{`INCR views`, "(integer) 1"},
+		{`INCR views`, "(integer) 2"},
+		{`incrby views 10`, "(integer) 12"},
+		{`DECR views`, "(integer) 11"},
+		{`DECRBY views 20`, "(integer) -9"},
+		{`INCRBY views -1`, "(integer) -10"},
+		{`DECRBY views -10`, "(integer) 0"},
+		{`GET views`, `"0"`},
+		{`DECR stock`, "(integer) -1"},
+
+		// The expiry is kept, like Redis.
+		{`SET rate 5 EX 60`, "OK"},
+		{`INCR rate`, "(integer) 6"},
+		{`TTL rate`, "(integer) 60"},
+
+		{`SET name raiyaan`, "OK"},
+		{`INCR name`, "(error) value is not an integer or out of range"},
+		{`SET n 05`, "OK"},
+		{`INCR n`, "(error) value is not an integer or out of range"},
+		{`SET max 9223372036854775807`, "OK"},
+		{`INCR max`, "(error) increment or decrement would overflow"},
+		{`GET max`, `"9223372036854775807"`},
+		{`SET min -9223372036854775807`, "OK"},
+		{`DECR min`, "(integer) -9223372036854775808"},
+		{`DECR min`, "(error) increment or decrement would overflow"},
+		{`DECRBY zero -9223372036854775808`, "(error) increment or decrement would overflow"},
+		{`INCRBY zero -9223372036854775808`, "(integer) -9223372036854775808"},
+
+		{`INCR`, "(error) usage: INCR <key>"},
+		{`INCR a b`, "(error) usage: INCR <key>"},
+		{`DECR`, "(error) usage: DECR <key>"},
+		{`INCRBY a`, "(error) usage: INCRBY <key> <n>"},
+		{`DECRBY a 1 2`, "(error) usage: DECRBY <key> <n>"},
+		{`INCRBY a 1.5`, "(error) the amount must be a whole number that fits in 64 bits"},
+		{`DECRBY a 9223372036854775808`, "(error) the amount must be a whole number that fits in 64 bits"},
+		{`INCR ""`, "(error) key must not be empty"},
+
+		{`INCR sql:schema:t`, managedErr},
+		{`DECRBY vec:x 1`, managedErr},
+	}
+	for _, s := range steps {
+		if got := run(t, e, s.in); got != s.want {
+			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
+	}
+}
