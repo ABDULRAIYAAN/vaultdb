@@ -31,6 +31,7 @@ const HelpText = `Commands:
   DEL <key>           delete a key
   INCR <key>  |  DECR <key>  add / take away 1 (a missing key starts at 0)
   INCRBY <key> <n>  |  DECRBY <key> <n>   add / take away n
+  INCRBYFLOAT <key> <n>  add a decimal number, e.g. 2.5 or -0.75
   EXISTS <key>        1 if the key exists, 0 if not
   EXPIRE <key> <seconds>     delete the key after this many seconds
   PEXPIRE <key> <ms>         the same, in milliseconds
@@ -129,7 +130,7 @@ func managed(key string) bool {
 // argument.
 var writesKey = map[string]bool{
 	"SET": true, "DEL": true, "PERSIST": true, "GETDEL": true,
-	"INCR": true, "DECR": true, "INCRBY": true, "DECRBY": true,
+	"INCR": true, "DECR": true, "INCRBY": true, "DECRBY": true, "INCRBYFLOAT": true,
 	"EXPIRE": true, "PEXPIRE": true, "EXPIREAT": true, "PEXPIREAT": true,
 }
 
@@ -251,6 +252,20 @@ func (e *Engine) Execute(cmd parser.Command) string {
 			return "(error) " + err.Error()
 		}
 		return fmt.Sprintf("(integer) %d", n)
+
+	case "INCRBYFLOAT":
+		if len(cmd.Args) != 2 {
+			return usage("INCRBYFLOAT <key> <n>")
+		}
+		delta, ok := store.ParseDecimal(cmd.Args[1])
+		if !ok {
+			return "(error) the amount must be a decimal number, like 2.5 or -1e3"
+		}
+		v, err := e.store.IncrByFloat(cmd.Args[0], delta)
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return strconv.Quote(v)
 
 	case "EXISTS":
 		if len(cmd.Args) != 1 {

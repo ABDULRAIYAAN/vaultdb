@@ -12,9 +12,9 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 | | |
 |---|---|
-| Code | about 10,200 lines of Go, plus 6,700 lines of tests |
-| Tests | 176 tests and 2 fuzz tests, all passing under Go's race detector |
-| Test coverage | 91.7% of the database packages (`internal/`) |
+| Code | about 10,300 lines of Go, plus 6,900 lines of tests |
+| Tests | 179 tests and 3 fuzz tests, all passing under Go's race detector |
+| Test coverage | 91.8% of the database packages (`internal/`) |
 | Dependencies | none: only the Go standard library |
 | Key-value reads | 597 ns per lookup at 100,000 keys, 7.7x faster than SQLite, which in turn wins every SQL query test ([details](#vaultdb-vs-sqlite)) |
 | Durable writes | 161 µs per write with fsync, 1.4x faster than SQLite |
@@ -23,7 +23,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`SET ... EX`, `EXPIRE`, `TTL`, `PERSIST`, or a set moment with `EXAT` and `EXPIREAT`) whose deadlines survive restarts, with `NX`/`XX` for set-if-missing and set-if-exists, `NX`/`XX`/`GT`/`LT` on `EXPIRE` to only add, replace, extend or shorten an expiry, `GET` to swap a value and get the old one back, and `GETDEL`/`GETEX` to read a key and delete it or change its expiry in one step, has atomic counters (`INCR`, `DECR`, `INCRBY`, `DECRBY`) that never lose an update when many clients count at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`SET ... EX`, `EXPIRE`, `TTL`, `PERSIST`, or a set moment with `EXAT` and `EXPIREAT`) whose deadlines survive restarts, with `NX`/`XX` for set-if-missing and set-if-exists, `NX`/`XX`/`GT`/`LT` on `EXPIRE` to only add, replace, extend or shorten an expiry, `GET` to swap a value and get the old one back, and `GETDEL`/`GETEX` to read a key and delete it or change its expiry in one step, has atomic counters (`INCR`, `DECR`, `INCRBY`, `DECRBY`, and `INCRBYFLOAT` for decimals) that never lose an update when many clients count at once, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -556,6 +556,7 @@ The decoder checks everything it reads (value count, each tag against the column
 | `DEL <key>` | Delete a key. Returns 1 if it existed, 0 if not |
 | `INCR <key>` / `DECR <key>` | Add / take away 1 and reply with the new number. A missing key starts at 0, and the key's expiry is kept |
 | `INCRBY <key> <n>` / `DECRBY <key> <n>` | Add / take away `n`. The value must be a whole number that fits in 64 bits, written plainly (`42`, `-7`; not `+42`, `042` or `4.2`), and a result that wouldn't fit is refused |
+| `INCRBYFLOAT <key> <n>` | Add a decimal number (`2.5`, `-0.75`, `1e3`) and reply with the new value. Works on whole numbers too, and a whole result is stored with no point, so `INCR` keeps working on it. Uses 64-bit floats, so `0.1 + 0.2` is `0.30000000000000004`. A result that would be infinite is refused, and the key's expiry is kept |
 | `EXISTS <key>` | 1 if the key exists, 0 if not |
 | `EXPIRE <key> <seconds>` | Delete the key after this many seconds. 1 if the key exists, 0 if not. Zero or less deletes it now |
 | `PEXPIRE <key> <ms>` | The same, in milliseconds |
@@ -673,6 +674,19 @@ vaultdb> TTL lock
 
 `INCR`, `DECR`, `INCRBY` and `DECRBY` keep a key's expiry, which makes the classic rate limiter two commands: `INCR` a per-user key, and give it a window with `EXPIRE ... NX` the first time. Each one reads the number, adds to it and writes it back under one lock, so 8 clients doing 500 `INCR`s each always end at 4,000 (done as `GET` then `SET` from the clients, two of them would both read 41 and both write 42). When the key has an expiry the new number is written as one `SETEX` with the same deadline, so a crash can't keep the count but lose the window.
 
+`INCRBYFLOAT` does the same for decimal numbers, like a running balance or a total of seconds. It accepts any plain decimal (`5`, `+1.5`, `.5`, `2.5e-3`) but not `inf`, `nan`, hex or spaces, and writes the result back in the shortest plain form that reads back as the same 64-bit float: never with an exponent, never as `-0`, and with no `.0` on whole numbers.
+
+```
+vaultdb> INCRBYFLOAT balance 10.50
+"10.5"
+vaultdb> INCRBYFLOAT balance -2.25
+"8.25"
+vaultdb> INCRBYFLOAT balance 1.75
+"10"
+vaultdb> INCR balance
+(integer) 11
+```
+
 ```
 vaultdb> INCR rate:42
 (integer) 1
@@ -744,6 +758,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 11d. `GETDEL` and `GETEX`: read a key and delete it, or change its expiry, in one step
 - [x] 11e. `EXPIRE` options `NX`, `XX`, `GT`, `LT`: only add, replace, extend or shorten an expiry
 - [x] 12. Atomic counters: `INCR`, `DECR`, `INCRBY`, `DECRBY`, keeping the key's expiry
+- [x] 12b. Decimal counters: `INCRBYFLOAT`
 
 ## Author
 

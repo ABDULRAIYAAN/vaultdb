@@ -296,3 +296,23 @@ Tests: `IncrBy` on missing keys, negative steps, every accepted and refused valu
 Updated the README numbers too: 176 tests, 91.7% coverage.
 
 Not done yet: `INCRBYFLOAT` for decimal counters. The playground is still on the old WebAssembly build.
+
+## 2026-11-25: Decimal counters (INCRBYFLOAT)
+
+Yesterday's leftover. `INCRBYFLOAT key 2.5` adds a decimal number to the value at a key and replies with the new value, so `INCRBYFLOAT balance -2.25` on `"10.5"` gives `"8.25"`. A missing key starts at 0. The store side is `IncrByFloat` in `internal/store/counter.go`, next to `IncrBy`.
+
+Why: `INCR` covers counting, but plenty of running totals aren't whole numbers: a balance, seconds of watch time, a score with a weight. Without this, the only way to add 0.5 to a key is `GET`, add, `SET`, which has the same lost-update race `INCR` fixed yesterday.
+
+How it works:
+
+- Values are read and added as 64-bit floats, under the write lock like `IncrBy`. That means the normal float rounding: `0.1 + 0.2` is `0.30000000000000004`, and past 2^53 whole numbers lose their last digits. Redis uses 80-bit floats and rounds to 17 digits, so the last digit can differ from Redis. `INCR` is still exact all the way to 2^63, so it's the one to use for whole counts.
+- Any plain decimal counts as a number: an optional sign, digits with an optional point, and an optional exponent (`5`, `+1.5`, `.5`, `5.`, `2.5e-3`). Spaces, `inf`, `nan`, hex floats, `_` and anything too big for a float64 are refused with `value is not a valid float`. I wrote a small hand check (`isDecimal`) instead of trusting `strconv.ParseFloat` alone, because that one happily accepts `Inf`, `NaN`, `0x1p-2` and `1_000`-style input.
+- The result is written in the shortest plain decimal that reads back as the same float64 (`strconv.FormatFloat(f, 'f', -1, 64)`): no exponent, no `-0`, and no `.0` on whole numbers, so `INCR` keeps working on a key `INCRBYFLOAT` touched and the other way round.
+- A result that would be infinite (or NaN) is refused with `increment would produce NaN or Infinity` and nothing is written.
+- The key's expiry is kept, the same way as `IncrBy`. I pulled the "write the value, and the deadline too if there is one" part out into `setKeepDeadlineLocked`, so both counters share it. No new log record types.
+
+Tests: every step and value form, accepted and refused, with refused values left unchanged; the 2^53 precision limit as an explicit case; non-finite results; the deadline kept across a restart and a compaction; refused increments not growing the log; a race test with 8 goroutines adding 0.5 or 0.25 (exact in binary, so the total has one right answer) before and after a restart; and a new fuzz test, `FuzzParseDecimal`, which checks that anything accepted is finite and that what gets written reads back as the same number. It ran about a million inputs clean. Engine tests cover the command, its replies and every error. I broke it eight ways on purpose (no `-0` fix, dropped deadline, out-of-range values accepted, infinite results accepted, exponent output, trailing junk accepted, empty exponent accepted, and the validator check on its own) and each one fails at least one test.
+
+README numbers: 179 tests and 3 fuzz tests, 91.8% coverage.
+
+Not done yet: the playground is still on the old WebAssembly build, so this week's commands aren't on the site.

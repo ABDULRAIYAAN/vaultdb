@@ -532,6 +532,28 @@ func TestCounters(t *testing.T) {
 
 		{`INCR sql:schema:t`, managedErr},
 		{`DECRBY vec:x 1`, managedErr},
+
+		{`INCRBYFLOAT price 10.50`, `"10.5"`},
+		{`incrbyfloat price 0.1`, `"10.6"`},
+		{`INCRBYFLOAT price -5.6`, `"5"`},
+		{`INCR price`, "(integer) 6"},
+		{`INCRBYFLOAT price 5.0e3`, `"5006"`},
+		{`INCRBYFLOAT price -1e4`, `"-4994"`},
+		{`SET rate2 1.5 EX 60`, "OK"},
+		{`INCRBYFLOAT rate2 1`, `"2.5"`},
+		{`TTL rate2`, "(integer) 60"},
+		{`INCRBYFLOAT name 1`, "(error) value is not a valid float"},
+		{`SET inf inf`, "OK"},
+		{`INCRBYFLOAT inf 1`, "(error) value is not a valid float"},
+		{`SET big 1` + strings.Repeat("0", 308), "OK"},
+		{`INCRBYFLOAT big 1e308`, "(error) increment would produce NaN or Infinity"},
+		{`INCRBYFLOAT a`, "(error) usage: INCRBYFLOAT <key> <n>"},
+		{`INCRBYFLOAT a 1 2`, "(error) usage: INCRBYFLOAT <key> <n>"},
+		{`INCRBYFLOAT a abc`, "(error) the amount must be a decimal number, like 2.5 or -1e3"},
+		{`INCRBYFLOAT a nan`, "(error) the amount must be a decimal number, like 2.5 or -1e3"},
+		{`INCRBYFLOAT a 1e400`, "(error) the amount must be a decimal number, like 2.5 or -1e3"},
+		{`INCRBYFLOAT "" 1`, "(error) key must not be empty"},
+		{`INCRBYFLOAT sql:schema:t 1`, managedErr},
 	}
 	for _, s := range steps {
 		if got := run(t, e, s.in); got != s.want {
