@@ -316,3 +316,24 @@ Tests: every step and value form, accepted and refused, with refused values left
 README numbers: 179 tests and 3 fuzz tests, 91.8% coverage.
 
 Not done yet: the playground is still on the old WebAssembly build, so this week's commands aren't on the site.
+
+## 2026-11-26: String commands (APPEND, STRLEN, GETRANGE)
+
+The counters are done, so today's another small one: three commands that work on a value as a run of bytes. `APPEND key text` adds to the end and replies with the new length, `STRLEN key` gives the length, and `GETRANGE key start end` returns a slice. The store side is `Append`, `StrLen` and `GetRange` in the new `internal/store/strings.go`.
+
+Why: appending is the other common read-then-write people do from a client (a log line, an audit trail, a small buffer). `GET`, concatenate, `SET` loses one of two appends that land at the same time, exactly like the counter race. `APPEND` does it under the write lock. `STRLEN` and `GETRANGE` are the cheap reads that go with it, so you can check the size of a value or read the last few bytes without pulling the whole thing over the network.
+
+How it works:
+
+- Everything counts bytes, not characters, like Redis. `café` is 5 bytes, and `GETRANGE` can cut the `é` in half. That keeps offsets exact and means no decoding.
+- `GETRANGE` uses Redis offsets: both ends included, negative ones count back from the end (`0 -1` is all of it, `-3 -1` the last three bytes). Offsets past either end get pulled back to it, and anything that ends up empty returns `""`, as does a missing key. The slicing lives in a small `byteRange` function on its own so it can be fuzzed. Writing it out, I noticed that after clamping, "start past the end" and "end before the start" both come down to `start > end`, so that's the only check.
+- `APPEND` on a missing key starts from `""`, so it creates the key (even when the text is empty, like Redis). Appending `""` to a key that exists writes nothing to the log.
+- The key's expiry is kept, using the `setKeepDeadlineLocked` helper from yesterday, so the value and the deadline go to the log as one `SETEX`. No new log record types.
+- A result over the 64 MB value limit is refused and nothing changes. With an expiry the limit is 8 bytes lower, because compaction writes the key as one `SETEX` with the deadline in front of the value.
+- The log stores whole values, so each `APPEND` writes the full new value, not just the new part. Appending lots of small pieces to one key costs about n²/2 bytes of log until compaction clears the old copies. Fine for log lines and buffers, which is what this is for.
+
+Tests: `Append` step by step (including a multi-byte character and `""`), `APPEND` on a number still leaving `INCR` working, the deadline being kept and coming back after a restart and after compaction then a restart, an expired key starting over with no deadline, the size limit with and without a deadline, and a race test with 8 goroutines appending 200 times each that checks every piece is there before and after a restart. `GetRange` has the examples from the Redis docs plus every edge I could think of, including `MinInt64`/`MaxInt64` offsets. A new fuzz test, `FuzzByteRange`, checks the fast version against a slow one that walks every byte; it ran about 1.5 million inputs clean. Engine tests cover all three commands, their replies and errors. I broke it seven ways on purpose (dropping the deadline, no size check, no room for the deadline, logging empty appends, two off-by-ones in the clamping, and slicing one byte short) and each one fails at least one test.
+
+README numbers: 186 tests and 4 fuzz tests, coverage still 91.8%.
+
+Not done yet: `SETRANGE`, which overwrites part of a value at an offset and pads with zero bytes. The playground is still on the old WebAssembly build.

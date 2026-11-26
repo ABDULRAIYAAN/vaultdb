@@ -32,6 +32,10 @@ const HelpText = `Commands:
   INCR <key>  |  DECR <key>  add / take away 1 (a missing key starts at 0)
   INCRBY <key> <n>  |  DECRBY <key> <n>   add / take away n
   INCRBYFLOAT <key> <n>  add a decimal number, e.g. 2.5 or -0.75
+  APPEND <key> <text>  add text to the end of a value, reply with its length
+  STRLEN <key>        length of a value in bytes (0 if missing)
+  GETRANGE <key> <start> <end>  bytes start..end, both included;
+                      negative counts from the end, so 0 -1 is all of it
   EXISTS <key>        1 if the key exists, 0 if not
   EXPIRE <key> <seconds>     delete the key after this many seconds
   PEXPIRE <key> <ms>         the same, in milliseconds
@@ -131,6 +135,7 @@ func managed(key string) bool {
 var writesKey = map[string]bool{
 	"SET": true, "DEL": true, "PERSIST": true, "GETDEL": true,
 	"INCR": true, "DECR": true, "INCRBY": true, "DECRBY": true, "INCRBYFLOAT": true,
+	"APPEND": true,
 	"EXPIRE": true, "PEXPIRE": true, "EXPIREAT": true, "PEXPIREAT": true,
 }
 
@@ -266,6 +271,33 @@ func (e *Engine) Execute(cmd parser.Command) string {
 			return "(error) " + err.Error()
 		}
 		return strconv.Quote(v)
+
+	case "APPEND":
+		if len(cmd.Args) != 2 {
+			return usage("APPEND <key> <text>")
+		}
+		n, err := e.store.Append(cmd.Args[0], cmd.Args[1])
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return fmt.Sprintf("(integer) %d", n)
+
+	case "STRLEN":
+		if len(cmd.Args) != 1 {
+			return usage("STRLEN <key>")
+		}
+		return fmt.Sprintf("(integer) %d", e.store.StrLen(cmd.Args[0]))
+
+	case "GETRANGE":
+		if len(cmd.Args) != 3 {
+			return usage("GETRANGE <key> <start> <end>")
+		}
+		start, err1 := strconv.ParseInt(cmd.Args[1], 10, 64)
+		end, err2 := strconv.ParseInt(cmd.Args[2], 10, 64)
+		if err1 != nil || err2 != nil {
+			return "(error) start and end must be whole numbers, like 0 and -1"
+		}
+		return strconv.Quote(e.store.GetRange(cmd.Args[0], start, end))
 
 	case "EXISTS":
 		if len(cmd.Args) != 1 {

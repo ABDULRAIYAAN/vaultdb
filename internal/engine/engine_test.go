@@ -561,3 +561,51 @@ func TestCounters(t *testing.T) {
 		}
 	}
 }
+
+func TestStringCommands(t *testing.T) {
+	e := New(store.New())
+	const managedErr = "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
+	steps := []struct{ in, want string }{
+		{`APPEND log "started"`, "(integer) 7"},
+		{`append log "; loaded 3 keys"`, "(integer) 22"},
+		{`GET log`, `"started; loaded 3 keys"`},
+		{`STRLEN log`, "(integer) 22"},
+		{`STRLEN missing`, "(integer) 0"},
+		{`APPEND log ""`, "(integer) 22"},
+		{`APPEND new ""`, "(integer) 0"},
+		{`EXISTS new`, "(integer) 1"},
+		{`SET cafe café`, "OK"},
+		{`STRLEN cafe`, "(integer) 5"},
+
+		{`SET s "This is a string"`, "OK"},
+		{`GETRANGE s 0 3`, `"This"`},
+		{`GETRANGE s -3 -1`, `"ing"`},
+		{`GETRANGE s 0 -1`, `"This is a string"`},
+		{`getrange s 10 100`, `"string"`},
+		{`GETRANGE s 5 4`, `""`},
+		{`GETRANGE missing 0 -1`, `""`},
+
+		// The expiry is kept, and APPEND on a number still leaves INCR working.
+		{`SET n 4 EX 60`, "OK"},
+		{`APPEND n 2`, "(integer) 2"},
+		{`INCR n`, "(integer) 43"},
+		{`TTL n`, "(integer) 60"},
+
+		{`APPEND a`, "(error) usage: APPEND <key> <text>"},
+		{`APPEND a b c`, "(error) usage: APPEND <key> <text>"},
+		{`STRLEN`, "(error) usage: STRLEN <key>"},
+		{`STRLEN a b`, "(error) usage: STRLEN <key>"},
+		{`GETRANGE s 0`, "(error) usage: GETRANGE <key> <start> <end>"},
+		{`GETRANGE s 0 1.5`, "(error) start and end must be whole numbers, like 0 and -1"},
+		{`GETRANGE s x 1`, "(error) start and end must be whole numbers, like 0 and -1"},
+		{`GETRANGE s 0 99999999999999999999`, "(error) start and end must be whole numbers, like 0 and -1"},
+		{`APPEND "" x`, "(error) key must not be empty"},
+		{`APPEND sql:schema:t x`, managedErr},
+		{`APPEND vec:x x`, managedErr},
+	}
+	for _, s := range steps {
+		if got := run(t, e, s.in); got != s.want {
+			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
+	}
+}
