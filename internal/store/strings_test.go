@@ -270,3 +270,266 @@ func FuzzByteRange(f *testing.F) {
 		}
 	})
 }
+
+func TestSetRange(t *testing.T) {
+	s := New()
+	// The examples from the Redis docs.
+	s.Set("key1", "Hello World")
+	if n, err := s.SetRange("key1", 6, "Redis"); n != 11 || err != nil {
+		t.Fatalf("SetRange(key1, 6, Redis) = %d, %v; want 11", n, err)
+	}
+	if v, _ := s.Get("key1"); v != "Hello Redis" {
+		t.Fatalf("key1 = %q, want \"Hello Redis\"", v)
+	}
+	if n, err := s.SetRange("key2", 6, "Redis"); n != 11 || err != nil {
+		t.Fatalf("SetRange(key2, 6, Redis) = %d, %v; want 11", n, err)
+	}
+	if v, _ := s.Get("key2"); v != "\x00\x00\x00\x00\x00\x00Redis" {
+		t.Fatalf("key2 = %q, want six zero bytes then Redis", v)
+	}
+
+	steps := []struct {
+		offset int64
+		text   string
+		want   int
+		val    string
+	}{
+		{0, "abc", 3, "abc"},          // missing key, no padding
+		{1, "X", 3, "aXc"},            // in the middle: the tail is kept
+		{2, "YZ", 4, "aXYZ"},          // runs past the end: grows
+		{4, "!", 5, "aXYZ!"},          // right at the end: like APPEND
+		{7, "?", 8, "aXYZ!\x00\x00?"}, // past the end: zero-padded
+		{0, "", 8, "aXYZ!\x00\x00?"},  // empty text: no change
+		{5, "é", 8, "aXYZ!\xc3\xa9?"}, // offsets count bytes
+	}
+	for _, st := range steps {
+		n, err := s.SetRange("k", st.offset, st.text)
+		if n != st.want || err != nil {
+			t.Fatalf("SetRange(k, %d, %q) = %d, %v; want %d", st.offset, st.text, n, err, st.want)
+		}
+		if v, _ := s.Get("k"); v != st.val {
+			t.Fatalf("after SetRange(k, %d, %q): %q, want %q", st.offset, st.text, v, st.val)
+		}
+	}
+
+	// An empty text on a missing key doesn't create it, unlike APPEND.
+	if n, err := s.SetRange("nothing", 5, ""); n != 0 || err != nil {
+		t.Fatalf("SetRange(nothing, 5, \"\") = %d, %v", n, err)
+	}
+	if s.Exists("nothing") {
+		t.Fatal("SetRange of \"\" created a missing key")
+	}
+
+	// Patching one digit of a number leaves INCR working.
+	s.Set("n", "100")
+	s.SetRange("n", 0, "4")
+	if got, err := s.IncrBy("n", 1); got != 401 || err != nil {
+		t.Fatalf("IncrBy after SetRange = %d, %v; want 401", got, err)
+	}
+
+	if _, err := s.SetRange("k", -1, "x"); err != ErrOffsetRange {
+		t.Fatalf("negative offset: err = %v, want ErrOffsetRange", err)
+	}
+	if _, err := s.SetRange("", 0, "x"); err != ErrEmptyKey {
+		t.Fatalf("empty key: err = %v", err)
+	}
+	if v, _ := s.Get("k"); v != "aXYZ!\xc3\xa9?" {
+		t.Fatalf("a refused SetRange changed the value to %q", v)
+	}
+}
+
+func TestSetRangeKeepsDeadline(t *testing.T) {
+	c := newClock()
+	path := filepath.Join(t.TempDir(), "setrange.log")
+	opts := Options{Sync: false, Now: c.now}
+	s, _ := mustOpen(t, path, opts)
+	defer func() { s.Close() }()
+
+	s.SetWith("slot", "....", SetOptions{TTL: time.Minute})
+	c.advance(15 * time.Second)
+	if n, _ := s.SetRange("slot", 1, "ab"); n != 4 {
+		t.Fatalf("SetRange = %d, want 4", n)
+	}
+	if left, has, _ := s.TTL("slot"); !has || left != 45*time.Second {
+		t.Fatalf("TTL after SetRange = %v, %v; want 45s kept", left, has)
+	}
+
+	// The deadline went to the log with the value: it's still there after
+	// a restart, and after a compaction followed by a restart.
+	s.Close()
+	s, _ = mustOpen(t, path, opts)
+	if v, _ := s.Get("slot"); v != ".ab." {
+		t.Fatalf("after restart: %q, want \".ab.\"", v)
+	}
+	if left, has, _ := s.TTL("slot"); !has || left != 45*time.Second {
+		t.Fatalf("after restart TTL = %v, %v; want 45s", left, has)
+	}
+	if _, err := s.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, _ = mustOpen(t, path, opts)
+	if v, _ := s.Get("slot"); v != ".ab." {
+		t.Fatalf("after compaction and restart: %q, want \".ab.\"", v)
+	}
+	if left, has, _ := s.TTL("slot"); !has || left != 45*time.Second {
+		t.Fatalf("after compaction and restart TTL = %v, %v; want 45s", left, has)
+	}
+
+	// Writes that leave the bytes as they were don't touch the log.
+	before := s.Stats().LogBytes
+	for _, st := range []struct {
+		offset int64
+		text   string
+	}{{0, ""}, {1, "ab"}, {0, ".ab."}} {
+		if n, _ := s.SetRange("slot", st.offset, st.text); n != 4 {
+			t.Fatalf("SetRange(slot, %d, %q) = %d, want 4", st.offset, st.text, n)
+		}
+	}
+	if after := s.Stats().LogBytes; after != before {
+		t.Fatalf("SetRange with no change grew the log from %d to %d bytes", before, after)
+	}
+
+	// Once it has expired, SetRange starts again from "" with no deadline.
+	c.advance(45 * time.Second)
+	if n, _ := s.SetRange("slot", 2, "z"); n != 3 {
+		t.Fatalf("SetRange after expiry = %d, want 3", n)
+	}
+	if v, _ := s.Get("slot"); v != "\x00\x00z" {
+		t.Fatalf("after expiry: %q, want \"\\x00\\x00z\"", v)
+	}
+	if _, has, _ := s.TTL("slot"); has {
+		t.Fatal("SetRange on an expired key kept the old deadline")
+	}
+}
+
+func TestSetRangeTooLarge(t *testing.T) {
+	s := New()
+	last := int64(aol.MaxFieldSize - 1)
+	if n, err := s.SetRange("big", last, "y"); n != aol.MaxFieldSize || err != nil {
+		t.Fatalf("SetRange up to the limit = %d, %v", n, err)
+	}
+	for _, st := range []struct {
+		offset int64
+		text   string
+	}{
+		{last, "yz"},
+		{last + 1, "z"},
+		{math.MaxInt64, "z"}, // must be refused, not overflow or allocate
+		{math.MaxInt64 - 1, "zz"},
+	} {
+		if _, err := s.SetRange("big", st.offset, st.text); err != aol.ErrTooLarge {
+			t.Fatalf("SetRange(big, %d, %q): err = %v, want ErrTooLarge", st.offset, st.text, err)
+		}
+	}
+	if n := s.StrLen("big"); n != aol.MaxFieldSize {
+		t.Fatalf("a refused SetRange changed the length to %d", n)
+	}
+	// Overwriting inside a full-size value is still fine.
+	if n, err := s.SetRange("big", 0, "start"); n != aol.MaxFieldSize || err != nil {
+		t.Fatalf("SetRange inside a full value = %d, %v", n, err)
+	}
+	if _, err := s.SetRange("missing", math.MaxInt64, "z"); err != aol.ErrTooLarge {
+		t.Fatalf("huge offset on a missing key: err = %v", err)
+	}
+	if s.Exists("missing") {
+		t.Fatal("a refused SetRange created the key")
+	}
+
+	// With a deadline the value has to leave room for it in the record.
+	room := int64(aol.MaxFieldSize - aol.DeadlineSize)
+	s.SetWith("bigttl", "", SetOptions{TTL: time.Hour})
+	if n, err := s.SetRange("bigttl", room-1, "y"); int64(n) != room || err != nil {
+		t.Fatalf("SetRange up to the limit with a deadline = %d, %v", n, err)
+	}
+	if _, err := s.SetRange("bigttl", room, "z"); err != aol.ErrTooLarge {
+		t.Fatalf("SetRange past the limit with a deadline: err = %v, want ErrTooLarge", err)
+	}
+	if n := int64(s.StrLen("bigttl")); n != room {
+		t.Fatalf("a refused SetRange changed the length to %d", n)
+	}
+}
+
+func TestSetRangeNoLostUpdates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setrange.log")
+	s, _ := mustOpen(t, path, Options{Sync: false})
+	const workers, each = 8, 100
+	// Each worker fills its own stretch of one shared value, one byte at a
+	// time, so a lost update would leave a zero byte behind.
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			piece := string(rune('a' + w))
+			for i := 0; i < each; i++ {
+				if _, err := s.SetRange("grid", int64(w*each+i), piece); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	var want strings.Builder
+	for w := 0; w < workers; w++ {
+		want.WriteString(strings.Repeat(string(rune('a'+w)), each))
+	}
+	check := func(when string) {
+		if v, _ := s.Get("grid"); v != want.String() {
+			t.Fatalf("%s: got %q, want %q: some writes were lost", when, v, want.String())
+		}
+	}
+	check("before restart")
+	s.Close()
+	s, _ = mustOpen(t, path, Options{Sync: false})
+	defer s.Close()
+	check("after restart")
+}
+
+// FuzzOverwriteAt checks overwriteAt against a slow version that works out
+// each byte of the result on its own.
+func FuzzOverwriteAt(f *testing.F) {
+	f.Add("Hello World", int64(6), "Redis", 64)
+	f.Add("", int64(3), "x", 64)
+	f.Add("abc", int64(0), "", 64)
+	f.Add("abc", int64(1), "longer", 5)
+	f.Add("abc", int64(math.MaxInt64), "x", 64)
+	f.Fuzz(func(t *testing.T, cur string, offset int64, text string, limit int) {
+		if limit < 0 || limit > 1<<16 || offset > 1<<20 {
+			t.Skip() // keep the slow version cheap
+		}
+		got, err := overwriteAt(cur, offset, text, limit)
+		if offset < 0 {
+			if err != ErrOffsetRange {
+				t.Fatalf("offset %d: err = %v, want ErrOffsetRange", offset, err)
+			}
+			return
+		}
+		n := int64(len(cur))
+		if end := offset + int64(len(text)); end > n {
+			n = end
+		}
+		if n > int64(limit) {
+			if err != aol.ErrTooLarge {
+				t.Fatalf("length %d over limit %d: err = %v, want ErrTooLarge", n, limit, err)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("overwriteAt(%q, %d, %q, %d): unexpected err %v", cur, offset, text, limit, err)
+		}
+		want := make([]byte, n)
+		for i := int64(0); i < n; i++ {
+			switch {
+			case i >= offset && i < offset+int64(len(text)):
+				want[i] = text[i-offset]
+			case i < int64(len(cur)):
+				want[i] = cur[i]
+			}
+		}
+		if got != string(want) {
+			t.Fatalf("overwriteAt(%q, %d, %q, %d) = %q, want %q", cur, offset, text, limit, got, want)
+		}
+	})
+}

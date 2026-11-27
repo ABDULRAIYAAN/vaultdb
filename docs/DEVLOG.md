@@ -337,3 +337,23 @@ Tests: `Append` step by step (including a multi-byte character and `""`), `APPEN
 README numbers: 186 tests and 4 fuzz tests, coverage still 91.8%.
 
 Not done yet: `SETRANGE`, which overwrites part of a value at an offset and pads with zero bytes. The playground is still on the old WebAssembly build.
+
+## 2026-11-27: SETRANGE
+
+Yesterday's leftover, and the last of the string commands. `SETRANGE key offset text` writes `text` over the value starting `offset` bytes in and replies with the new length, so `SETRANGE greeting 6 Redis` on `"Hello World"` gives `"Hello Redis"`. If the value is shorter than the offset, or the key is missing, the gap is filled with zero bytes first. The store side is `SetRange` in `internal/store/strings.go`, next to `Append`.
+
+Why: `APPEND` covers adding to the end, but sometimes you want to patch a bit in the middle: fix a status byte in a fixed-width record, flip one slot in a small array of flags, or rewrite a header without touching the rest. Doing that from a client means `GET`, edit, `SET`, which has the same lost-update race as before. Two clients patching different parts of one value at once would each write back their own copy and one patch would vanish. `SETRANGE` does it under the write lock.
+
+How it works:
+
+- The byte work is in a small `overwriteAt` function: make a buffer as long as the bigger of the old value and `offset + len(text)`, copy the old value in, then copy `text` over it at the offset. Go zeroes new memory, so the padding comes for free.
+- The size limit is checked before anything is allocated. `SETRANGE k 9223372036854775807 x` has to be refused straight away, not try to build a huge value or overflow `offset + len(text)`. Checking `offset` against the limit first means the addition after it can't overflow. With an expiry, the limit is 8 bytes lower, the same as `APPEND`; I pulled that rule out into `valueLimitLocked` so the two share it.
+- A negative offset is refused with `offset is out of range`, like Redis.
+- An empty `text` changes nothing and writes nothing, and unlike `APPEND` it doesn't create a missing key. That's what Redis does too. A write that leaves the bytes exactly as they were doesn't go to the log either.
+- The key's expiry is kept through `setKeepDeadlineLocked`, so value and deadline go to the log as one `SETEX`. No new log record types.
+
+Tests: the Redis doc examples, writing in the middle, at the end, past the end with padding, multi-byte text, a patched number still working with `INCR`, and a negative offset. The deadline is kept across a restart and a compaction, and an expired key starts over with no deadline. No-op writes don't grow the log. The size limit is checked at the exact edge, with `MaxInt64` offsets, and with and without a deadline. A race test has 8 goroutines each filling their own part of one shared value a byte at a time and checks nothing is lost, before and after a restart. A new fuzz test, `FuzzOverwriteAt`, checks the fast version against a slow one that works out every byte on its own; it ran about 2.7 million inputs clean. Engine tests cover the command, its replies and every error. I broke it seven ways on purpose (dropping the deadline, no room for the deadline, logging no-op writes, letting an empty text create the key, an off-by-one in the copy, reading an expired value as live, and loosening the limit check). Six failed a test straight away. The loose limit one didn't, because the final length check caught it anyway, so I simplified the code to one plain offset check plus that length check.
+
+README numbers: 190 tests and 5 fuzz tests, 91.9% coverage.
+
+Not done yet: the playground is still on the old WebAssembly build, so this week's commands aren't on the site.

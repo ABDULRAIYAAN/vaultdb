@@ -33,6 +33,8 @@ const HelpText = `Commands:
   INCRBY <key> <n>  |  DECRBY <key> <n>   add / take away n
   INCRBYFLOAT <key> <n>  add a decimal number, e.g. 2.5 or -0.75
   APPEND <key> <text>  add text to the end of a value, reply with its length
+  SETRANGE <key> <offset> <text>  overwrite bytes from offset on (zero-padded
+                      if the value is shorter), reply with its length
   STRLEN <key>        length of a value in bytes (0 if missing)
   GETRANGE <key> <start> <end>  bytes start..end, both included;
                       negative counts from the end, so 0 -1 is all of it
@@ -135,7 +137,7 @@ func managed(key string) bool {
 var writesKey = map[string]bool{
 	"SET": true, "DEL": true, "PERSIST": true, "GETDEL": true,
 	"INCR": true, "DECR": true, "INCRBY": true, "DECRBY": true, "INCRBYFLOAT": true,
-	"APPEND": true,
+	"APPEND": true, "SETRANGE": true,
 	"EXPIRE": true, "PEXPIRE": true, "EXPIREAT": true, "PEXPIREAT": true,
 }
 
@@ -277,6 +279,20 @@ func (e *Engine) Execute(cmd parser.Command) string {
 			return usage("APPEND <key> <text>")
 		}
 		n, err := e.store.Append(cmd.Args[0], cmd.Args[1])
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return fmt.Sprintf("(integer) %d", n)
+
+	case "SETRANGE":
+		if len(cmd.Args) != 3 {
+			return usage("SETRANGE <key> <offset> <text>")
+		}
+		offset, err := strconv.ParseInt(cmd.Args[1], 10, 64)
+		if err != nil {
+			return "(error) the offset must be a whole number, like 0 or 6"
+		}
+		n, err := e.store.SetRange(cmd.Args[0], offset, cmd.Args[2])
 		if err != nil {
 			return "(error) " + err.Error()
 		}

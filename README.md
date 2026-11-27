@@ -13,8 +13,8 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 | | |
 |---|---|
 | Code | about 10,300 lines of Go, plus 6,900 lines of tests |
-| Tests | 186 tests and 4 fuzz tests, all passing under Go's race detector |
-| Test coverage | 91.8% of the database packages (`internal/`) |
+| Tests | 190 tests and 5 fuzz tests, all passing under Go's race detector |
+| Test coverage | 91.9% of the database packages (`internal/`) |
 | Dependencies | none: only the Go standard library |
 | Key-value reads | 597 ns per lookup at 100,000 keys, 7.7x faster than SQLite, which in turn wins every SQL query test ([details](#vaultdb-vs-sqlite)) |
 | Durable writes | 161 µs per write with fsync, 1.4x faster than SQLite |
@@ -23,7 +23,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`SET ... EX`, `EXPIRE`, `TTL`, `PERSIST`, or a set moment with `EXAT` and `EXPIREAT`) whose deadlines survive restarts, with `NX`/`XX` for set-if-missing and set-if-exists, `NX`/`XX`/`GT`/`LT` on `EXPIRE` to only add, replace, extend or shorten an expiry, `GET` to swap a value and get the old one back, and `GETDEL`/`GETEX` to read a key and delete it or change its expiry in one step, has atomic counters (`INCR`, `DECR`, `INCRBY`, `DECRBY`, and `INCRBYFLOAT` for decimals) that never lose an update when many clients count at once, string commands (`APPEND`, `STRLEN`, `GETRANGE`) that grow and slice a value without a read-then-write race, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`SET ... EX`, `EXPIRE`, `TTL`, `PERSIST`, or a set moment with `EXAT` and `EXPIREAT`) whose deadlines survive restarts, with `NX`/`XX` for set-if-missing and set-if-exists, `NX`/`XX`/`GT`/`LT` on `EXPIRE` to only add, replace, extend or shorten an expiry, `GET` to swap a value and get the old one back, and `GETDEL`/`GETEX` to read a key and delete it or change its expiry in one step, has atomic counters (`INCR`, `DECR`, `INCRBY`, `DECRBY`, and `INCRBYFLOAT` for decimals) that never lose an update when many clients count at once, string commands (`APPEND`, `SETRANGE`, `STRLEN`, `GETRANGE`) that grow, patch and slice a value without a read-then-write race, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -558,6 +558,7 @@ The decoder checks everything it reads (value count, each tag against the column
 | `INCRBY <key> <n>` / `DECRBY <key> <n>` | Add / take away `n`. The value must be a whole number that fits in 64 bits, written plainly (`42`, `-7`; not `+42`, `042` or `4.2`), and a result that wouldn't fit is refused |
 | `INCRBYFLOAT <key> <n>` | Add a decimal number (`2.5`, `-0.75`, `1e3`) and reply with the new value. Works on whole numbers too, and a whole result is stored with no point, so `INCR` keeps working on it. Uses 64-bit floats, so `0.1 + 0.2` is `0.30000000000000004`. A result that would be infinite is refused, and the key's expiry is kept |
 | `APPEND <key> <text>` | Add text to the end of the value and reply with its new length in bytes. A missing key starts as `""`, and the key's expiry is kept |
+| `SETRANGE <key> <offset> <text>` | Overwrite the value from byte `offset` on with `text` and reply with its new length. Bytes after the overwritten part are kept, and a value shorter than `offset` (or a missing key) is padded with zero bytes first. An empty `text` changes nothing and doesn't create a missing key. The offset can't be negative, and the key's expiry is kept |
 | `STRLEN <key>` | Length of the value in bytes (`café` is 5), or 0 if the key is missing |
 | `GETRANGE <key> <start> <end>` | The bytes from `start` to `end`, both included. Negative offsets count back from the end, so `0 -1` is the whole value and `-3 -1` the last three bytes. Out-of-range offsets are pulled back to the ends, and an empty range or a missing key gives `""` |
 | `EXISTS <key>` | 1 if the key exists, 0 if not |
@@ -705,7 +706,7 @@ Removing an expired key from memory is **lazy**, like Redis. From the deadline o
 
 ### How the string commands work
 
-`APPEND`, `STRLEN` and `GETRANGE` treat a value as a run of bytes, like Redis. `APPEND` adds to the end under the write lock, so two clients writing to the same log line at once both land, and it keeps the key's expiry the same way the counters do. `GETRANGE` takes Redis-style offsets: both ends are included and negative ones count back from the end. All three count bytes rather than characters, so a range can cut a multi-byte character such as `é` in half. The log stores whole values, so each `APPEND` writes the full new value; that's fine for log lines and small buffers, and compaction clears out the old copies.
+`APPEND`, `SETRANGE`, `STRLEN` and `GETRANGE` treat a value as a run of bytes, like Redis. `APPEND` adds to the end and `SETRANGE` overwrites from an offset, both under the write lock, so two clients writing to the same value at once both land, and both keep the key's expiry the same way the counters do. `SETRANGE` past the end fills the gap with zero bytes, which makes a fixed-size value usable as a small array of flags or slots. `GETRANGE` takes Redis-style offsets: both ends are included and negative ones count back from the end. All four count bytes rather than characters, so a range can cut a multi-byte character such as `é` in half. The log stores whole values, so each `APPEND` or `SETRANGE` writes the full new value; that's fine for log lines and small buffers, and compaction clears out the old copies.
 
 ```
 vaultdb> APPEND log "started"
@@ -718,6 +719,14 @@ vaultdb> GETRANGE log -6 -1
 "3 keys"
 vaultdb> STRLEN log
 (integer) 22
+vaultdb> SETRANGE log 0 STARTED
+(integer) 22
+vaultdb> GET log
+"STARTED; loaded 3 keys"
+vaultdb> SETRANGE slots 3 x
+(integer) 4
+vaultdb> GET slots
+"\x00\x00\x00x"
 ```
 
 ### How the B-tree index works
@@ -780,7 +789,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 12. Atomic counters: `INCR`, `DECR`, `INCRBY`, `DECRBY`, keeping the key's expiry
 - [x] 12b. Decimal counters: `INCRBYFLOAT`
 - [x] 13. String commands: `APPEND`, `STRLEN`, `GETRANGE`
-- [ ] 13b. `SETRANGE`: overwrite part of a value at an offset
+- [x] 13b. `SETRANGE`: overwrite part of a value at an offset, zero-padding past the end
 
 ## Author
 
