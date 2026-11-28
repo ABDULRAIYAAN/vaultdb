@@ -13,8 +13,8 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 | | |
 |---|---|
 | Code | about 10,300 lines of Go, plus 6,900 lines of tests |
-| Tests | 190 tests and 5 fuzz tests, all passing under Go's race detector |
-| Test coverage | 91.9% of the database packages (`internal/`) |
+| Tests | 203 tests and 6 fuzz tests, all passing under Go's race detector |
+| Test coverage | 92.0% of the database packages (`internal/`) |
 | Dependencies | none: only the Go standard library |
 | Key-value reads | 597 ns per lookup at 100,000 keys, 7.7x faster than SQLite, which in turn wins every SQL query test ([details](#vaultdb-vs-sqlite)) |
 | Durable writes | 161 µs per write with fsync, 1.4x faster than SQLite |
@@ -23,7 +23,7 @@ The goal is to understand how real databases (Redis, Postgres, Bitcask, LevelDB,
 
 ## Status
 
-**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`SET ... EX`, `EXPIRE`, `TTL`, `PERSIST`, or a set moment with `EXAT` and `EXPIREAT`) whose deadlines survive restarts, with `NX`/`XX` for set-if-missing and set-if-exists, `NX`/`XX`/`GT`/`LT` on `EXPIRE` to only add, replace, extend or shorten an expiry, `GET` to swap a value and get the old one back, and `GETDEL`/`GETEX` to read a key and delete it or change its expiry in one step, has atomic counters (`INCR`, `DECR`, `INCRBY`, `DECRBY`, and `INCRBYFLOAT` for decimals) that never lose an update when many clients count at once, string commands (`APPEND`, `SETRANGE`, `STRLEN`, `GETRANGE`) that grow, patch and slice a value without a read-then-write race, and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
+**v1.0.0.** VaultDB finds data by meaning (vector similarity search with an HNSW index built from scratch), powers a chat-with-your-documents assistant that works with 11 AI providers, runs as a network server that many clients can use at once, keeps keys with a time to live (`SET ... EX`, `EXPIRE`, `TTL`, `PERSIST`, or a set moment with `EXAT` and `EXPIREAT`) whose deadlines survive restarts, with `NX`/`XX` for set-if-missing and set-if-exists, `NX`/`XX`/`GT`/`LT` on `EXPIRE` to only add, replace, extend or shorten an expiry, `GET` to swap a value and get the old one back, and `GETDEL`/`GETEX` to read a key and delete it or change its expiry in one step, has atomic counters (`INCR`, `DECR`, `INCRBY`, `DECRBY`, and `INCRBYFLOAT` for decimals) that never lose an update when many clients count at once, string commands (`APPEND`, `SETRANGE`, `STRLEN`, `GETRANGE`) that grow, patch and slice a value without a read-then-write race, multi-key `MSET`, `MSETNX` and `MGET` that write a group of keys all or nothing (one log record, so a crash can't keep half), and speaks SQL: tables, typed columns, primary keys, `WHERE` (with `IN`, `LIKE` and `BETWEEN`), `ORDER BY`, `LIMIT`, `DISTINCT`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, also over distinct values) with `GROUP BY` and `HAVING`, `UPDATE` and `DELETE`, secondary indexes (`CREATE INDEX`), a small query planner that turns conditions on the primary key or an indexed column into key lookups and B-tree range walks (with `EXPLAIN` to show the plan), all stored as compact binary rows under ordinary keys in a B-tree and saved to a checksummed, crash-safe, self-compacting log.
 
 ## Quick start
 
@@ -554,6 +554,9 @@ The decoder checks everything it reads (value count, each tag against the column
 | `GETDEL <key>` | Read a value and delete the key in one step, or `(nil)` if missing. Only one client can ever get it |
 | `GETEX <key> [EX <seconds> \| PX <ms> \| EXAT <unix-seconds> \| PXAT <unix-ms> \| PERSIST]` | Read a value and change its expiry in one step. With no option it's a plain `GET`; a moment that has already passed returns the value and deletes the key |
 | `DEL <key>` | Delete a key. Returns 1 if it existed, 0 if not |
+| `MSET <key> <value> [<key> <value> ...]` | Set many keys at once, all or nothing: no other client sees some set and others not, and a crash can't keep half of them. Like `SET`, it removes any expiry. If a key is given twice, the last value wins |
+| `MSETNX <key> <value> [<key> <value> ...]` | The same, but only if none of the keys exist. 1 if it set them all, 0 (and nothing written) if any one already existed |
+| `MGET <key> [<key> ...]` | Read many keys at once, in the order given, with `(nil)` for missing ones. All are read at the same moment, so an `MSET` never shows up half done |
 | `INCR <key>` / `DECR <key>` | Add / take away 1 and reply with the new number. A missing key starts at 0, and the key's expiry is kept |
 | `INCRBY <key> <n>` / `DECRBY <key> <n>` | Add / take away `n`. The value must be a whole number that fits in 64 bits, written plainly (`42`, `-7`; not `+42`, `042` or `4.2`), and a result that wouldn't fit is refused |
 | `INCRBYFLOAT <key> <n>` | Add a decimal number (`2.5`, `-0.75`, `1e3`) and reply with the new value. Works on whole numbers too, and a whole result is stored with no point, so `INCR` keeps working on it. Uses 64-bit floats, so `0.1 + 0.2` is `0.30000000000000004`. A result that would be infinite is refused, and the key's expiry is kept |
@@ -632,6 +635,8 @@ The file starts with a 9-byte header (`VAULTDB\0` plus a format version byte), f
  op: 1 = SET, 2 = DEL, 3 = CLEAR,        all integers big-endian
      4 = EXPIRE (value: deadline in Unix ms, empty = PERSIST)
      5 = SETEX  (value: 8-byte deadline in Unix ms, then the value)
+     6 = BATCH  (key empty; value: several of the above, each as
+                 op (1) | keyLen (4) | valLen (4) | key | value)
  hdrCRC  = CRC-32C of op, keyLen, valLen, bodyCRC
  bodyCRC = CRC-32C of key and value
 ```
@@ -639,6 +644,8 @@ The file starts with a 9-byte header (`VAULTDB\0` plus a format version byte), f
 Length prefixes (instead of, say, one line of text per record) mean keys and values can contain any bytes, including spaces, newlines and quotes, without escaping.
 
 **Why two checksums?** With a single checksum over the whole record, a flipped bit in a length field would make the reader trust a wrong length before it could check anything. It could then read past the real end of the record, decide the file was cut off, and throw away every valid record after it. Verifying the small fixed-size header first means a length is only used once it is known to be correct.
+
+**Batches** are how `MSET` stays all or nothing on disk. Written as separate `SET`s, a crash between the first and the last would keep some keys and lose the rest: half a transfer between two balances, say. Instead every `SET` goes inside one `BATCH` record, covered by the same two checksums as any other record. On replay the batch is either all there, or cut off and dropped as a torn write. A batch can't hold another batch, and compaction never writes one (it writes one record per key anyway), so after `COMPACT` the log has none. A build from before batches would report a log that contains one as corrupt, so don't open such a log with an older VaultDB (compact it first if you have to).
 
 ### How expiring keys work
 
@@ -729,6 +736,26 @@ vaultdb> GET slots
 "\x00\x00\x00x"
 ```
 
+### How the multi-key commands work
+
+`MSET`, `MSETNX` and `MGET` do many keys in one command. Besides saving round trips, the writes are all or nothing twice over: in memory they run under one write lock, so `MGET` from another client sees either all of an `MSET` or none of it, and on disk the whole `MSET` is one `BATCH` record (see [How persistence works](#how-persistence-works)), so a crash can't keep half. That makes `MSET` the way to change values that only make sense together. `MSETNX` sets its keys only if none of them exist, so two clients claiming overlapping groups of names can't each end up with part of what they asked for.
+
+```
+vaultdb> MSET balance:ali 60 balance:sara 40
+OK
+vaultdb> MGET balance:ali balance:sara balance:omar
+1) "60"
+2) "40"
+3) (nil)
+vaultdb> MSETNX seat:1 ali seat:2 ali
+(integer) 1
+vaultdb> MSETNX seat:2 sara seat:3 sara
+(integer) 0
+vaultdb> MGET seat:2 seat:3
+1) "ali"
+2) (nil)
+```
+
 ### How the B-tree index works
 
 Keys are kept in a **B-tree**, the structure behind the indexes in Postgres, MySQL and SQLite. Each node holds a sorted list of 31 to 63 keys, and a node with *n* keys has *n + 1* children holding the keys that fall between them:
@@ -790,6 +817,7 @@ A rename within one folder is **atomic**: at every moment the path holds either 
 - [x] 12b. Decimal counters: `INCRBYFLOAT`
 - [x] 13. String commands: `APPEND`, `STRLEN`, `GETRANGE`
 - [x] 13b. `SETRANGE`: overwrite part of a value at an offset, zero-padding past the end
+- [x] 14. Multi-key commands: `MSET`, `MSETNX`, `MGET`, with all-or-nothing `BATCH` log records
 
 ## Author
 

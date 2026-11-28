@@ -632,3 +632,48 @@ func TestStringCommands(t *testing.T) {
 		}
 	}
 }
+
+func TestMultiKeyCommands(t *testing.T) {
+	e := New(store.New())
+	const managedErr = "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
+	steps := []struct{ in, want string }{
+		{`MSET name raiyaan uni "Taylor's" empty ""`, "OK"},
+		{`MGET name missing empty uni`, "1) \"raiyaan\"\n2) (nil)\n3) \"\"\n4) \"Taylor's\""},
+		{`mget name`, `1) "raiyaan"`},
+		{`MSET k 1 k 2`, "OK"},
+		{`GET k`, `"2"`},
+
+		// MSET drops an expiry, like SET.
+		{`SET otp 1234 EX 60`, "OK"},
+		{`MSET otp 5678 x y`, "OK"},
+		{`TTL otp`, "(integer) -1"},
+
+		// MSETNX: all or nothing.
+		{`MSETNX seat1 ali seat2 ali`, "(integer) 1"},
+		{`MSETNX seat3 sara seat2 sara`, "(integer) 0"},
+		{`MGET seat1 seat2 seat3`, "1) \"ali\"\n2) \"ali\"\n3) (nil)"},
+		{`msetnx seat3 sara`, "(integer) 1"},
+
+		{`MSET`, "(error) usage: MSET <key> <value> [<key> <value> ...]"},
+		{`MSET a`, "(error) usage: MSET <key> <value> [<key> <value> ...]"},
+		{`MSET a 1 b`, "(error) usage: MSET <key> <value> [<key> <value> ...]"},
+		{`MSETNX a`, "(error) usage: MSETNX <key> <value> [<key> <value> ...]"},
+		{`MGET`, "(error) usage: MGET <key> [<key> ...]"},
+		{`MSET a 1 "" 2`, "(error) key must not be empty"},
+		{`MSETNX "" 2`, "(error) key must not be empty"},
+		{`EXISTS a`, "(integer) 0"},
+		// A managed key anywhere in the list refuses the whole command.
+		{`MSET a 1 sql:schema:t x`, managedErr},
+		{`MSETNX a 1 vec:x x`, managedErr},
+		{`EXISTS a`, "(integer) 0"},
+		// Reading managed keys is fine, as with GET. A value (not a key) that
+		// looks managed is just a value.
+		{`MSET a sql:x`, "OK"},
+		{`MGET a sql:schema:t`, "1) \"sql:x\"\n2) (nil)"},
+	}
+	for _, s := range steps {
+		if got := run(t, e, s.in); got != s.want {
+			t.Errorf("%s\n got: %s\nwant: %s", s.in, got, s.want)
+		}
+	}
+}

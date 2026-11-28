@@ -29,6 +29,9 @@ const HelpText = `Commands:
   GETEX <key> [EX <seconds> | PX <ms> | EXAT <unix-seconds> | PXAT <unix-ms> | PERSIST]
                       read a value and change its expiry, in one step
   DEL <key>           delete a key
+  MSET <key> <value> [<key> <value> ...]   set many keys at once, all or none
+  MSETNX <key> <value> [...]  the same, but only if none of the keys exist
+  MGET <key> [<key> ...]      read many keys at once
   INCR <key>  |  DECR <key>  add / take away 1 (a missing key starts at 0)
   INCRBY <key> <n>  |  DECRBY <key> <n>   add / take away n
   INCRBYFLOAT <key> <n>  add a decimal number, e.g. 2.5 or -0.75
@@ -123,6 +126,8 @@ func (e *Engine) ExecuteLine(line string) string {
 // step with the store, so it is refused.
 var managedPrefixes = []string{"sql:", "vec:"}
 
+const managedError = "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
+
 func managed(key string) bool {
 	for _, p := range managedPrefixes {
 		if strings.HasPrefix(key, p) {
@@ -146,7 +151,7 @@ func (e *Engine) Execute(cmd parser.Command) string {
 	// GETEX only writes when it's given an option; on its own it's a GET.
 	writes := writesKey[cmd.Name] || (cmd.Name == "GETEX" && len(cmd.Args) > 1)
 	if writes && len(cmd.Args) > 0 && managed(cmd.Args[0]) {
-		return "(error) keys starting with sql: or vec: are managed by SQL and vector commands; use those instead"
+		return managedError
 	}
 	if strings.HasPrefix(cmd.Name, "V") {
 		if reply, ok := e.vectorCommand(cmd); ok {
@@ -218,6 +223,47 @@ func (e *Engine) Execute(cmd parser.Command) string {
 			return "(error) " + err.Error()
 		}
 		return strconv.Quote(v)
+
+	case "MSET", "MSETNX":
+		if len(cmd.Args) == 0 || len(cmd.Args)%2 != 0 {
+			return usage(cmd.Name + " <key> <value> [<key> <value> ...]")
+		}
+		pairs := make([]store.KV, 0, len(cmd.Args)/2)
+		for i := 0; i < len(cmd.Args); i += 2 {
+			if managed(cmd.Args[i]) {
+				return managedError
+			}
+			pairs = append(pairs, store.KV{Key: cmd.Args[i], Value: cmd.Args[i+1]})
+		}
+		if cmd.Name == "MSET" {
+			if err := e.store.MSet(pairs); err != nil {
+				return "(error) " + err.Error()
+			}
+			return "OK"
+		}
+		ok, err := e.store.MSetNX(pairs)
+		if err != nil {
+			return "(error) " + err.Error()
+		}
+		return boolInt(ok)
+
+	case "MGET":
+		if len(cmd.Args) == 0 {
+			return usage("MGET <key> [<key> ...]")
+		}
+		values, found := e.store.MGet(cmd.Args)
+		var b strings.Builder
+		for i, v := range values {
+			if i > 0 {
+				b.WriteByte('\n')
+			}
+			if found[i] {
+				fmt.Fprintf(&b, "%d) %s", i+1, strconv.Quote(v))
+			} else {
+				fmt.Fprintf(&b, "%d) (nil)", i+1)
+			}
+		}
+		return b.String()
 
 	case "DEL":
 		if len(cmd.Args) != 1 {

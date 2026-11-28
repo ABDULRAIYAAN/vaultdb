@@ -2,11 +2,11 @@
 // a restart.
 //
 // The idea: never edit data in place. Every change (SET, DEL, CLEAR, EXPIRE,
-// SETEX) is
-// appended to the end of one file as a record. On startup, the database reads
-// the file from the beginning and replays every record, rebuilding the
-// in-memory map exactly as it was. Redis (AOF), Bitcask and the write-ahead
-// logs in Postgres and SQLite all build on this same idea.
+// SETEX, or a BATCH of them) is appended to the end of one file as a record.
+// On startup, the database reads the file from the beginning and replays
+// every record, rebuilding the in-memory map exactly as it was. Redis (AOF),
+// Bitcask and the write-ahead logs in Postgres and SQLite all build on this
+// same idea.
 //
 // File layout (format version 2):
 //
@@ -20,7 +20,7 @@
 //	+-------------+--------+------------+------------+--------------+-----+-------+
 //	| hdrCRC (4)  | op (1) | keyLen (4) | valLen (4) | bodyCRC (4)  | key | value |
 //	+-------------+--------+------------+------------+--------------+-----+-------+
-//	 op      = 1 SET, 2 DEL, 3 CLEAR, 4 EXPIRE, 5 SETEX
+//	 op      = 1 SET, 2 DEL, 3 CLEAR, 4 EXPIRE, 5 SETEX, 6 BATCH
 //	 hdrCRC  = CRC-32C of op, keyLen, valLen and bodyCRC
 //	 bodyCRC = CRC-32C of key and value
 //
@@ -72,9 +72,13 @@ const (
 	// half by a crash: as a SET followed by an EXPIRE, losing the second
 	// record would leave a key that never goes away.
 	OpSetExpire Op = 5
+	// OpBatch holds several of the records above that must all happen or
+	// none of them. Key is empty and Value packs the records together (see
+	// BatchValue and batch.go).
+	OpBatch Op = 6
 )
 
-func (o Op) valid() bool { return o >= OpSet && o <= OpSetExpire }
+func (o Op) valid() bool { return o >= OpSet && o <= OpBatch }
 
 // DeadlineSize is how many bytes the deadline takes at the start of an
 // OpSetExpire value.

@@ -357,3 +357,25 @@ Tests: the Redis doc examples, writing in the middle, at the end, past the end w
 README numbers: 190 tests and 5 fuzz tests, 91.9% coverage.
 
 Not done yet: the playground is still on the old WebAssembly build, so this week's commands aren't on the site.
+
+## 2026-11-28: MSET, MSETNX, MGET, and batch log records
+
+The string commands are done, so today I moved on to the multi-key ones. `MSET k1 v1 k2 v2 ...` sets a group of keys, `MSETNX` does the same only if none of them exist yet, and `MGET k1 k2 ...` reads a group back. The store side is `MSet`, `MSetNX` and `MGet` in the new `internal/store/multi.go`, and the log side is a new record type in `internal/aol/batch.go`.
+
+Why: saving round trips is nice, but the real reason is that some values only make sense together. If you move 60 from one balance to another with two `SET`s, another client can read in between and see the money in neither place (or both), and a crash between the two writes leaves it like that for good. So `MSET` has to be all or nothing, both in memory and on disk.
+
+How it works:
+
+- In memory it's easy: everything happens under one write lock, and `MGET` reads all its keys under one read lock at the same moment. A reader can never land half way through an `MSET`.
+- On disk it needed something new. Each record in the log already has two checksums and a torn record at the end is dropped on startup, so one record is already all or nothing. I added op 6, `BATCH`: its key is empty and its value packs several ordinary records one after another (op, key length, value length, key, value). `MSET` writes all its `SET`s as one batch, so a crash anywhere in the middle of writing it drops the whole thing on replay.
+- `SplitBatch` is strict: a length running past the end, bytes left over, an unknown op or a batch inside a batch all count as malformed. A batch's total size has the same 64 MB limit as any value, checked one entry at a time so the running total can't overflow, so `MSET a <40 MB> b <40 MB>` is refused even though each value fits on its own.
+- Replay just unpacks the batch and applies each record with the existing code, so the in-memory map and the byte counts for auto-compaction didn't need any new logic. Compaction still writes one record per key, so a compacted log never has a batch in it.
+- An `MSET` of one pair writes a plain `SET` instead of a batch of one, which keeps the log smaller.
+- Like `SET`, `MSET` removes any expiry, and a key listed twice keeps its last value. `MSETNX` treats an expired key as missing. A `sql:` or `vec:` key anywhere in the list refuses the whole command before anything is written.
+- One catch I wrote down in the README: a build from before today doesn't know op 6, so it would call a log with a batch in it corrupt. Running `COMPACT` first removes all batches if I ever need to go back.
+
+Tests: the aol side has a round trip for every op, the size limit at the exact edge, a list of malformed batches, a test that cuts a batch off at several points and checks replay drops all of it, and a new fuzz test, `FuzzSplitBatch`, which checks it never panics and that anything it accepts packs back into exactly the same bytes; it ran about 4.5 million inputs clean. On the store side, a crash test cuts the log at every single byte inside an `MSET` that moves a balance and checks that the old balances always come back. A race test has 4 writers moving a total of 100 between two keys while 4 readers check with `MGET` that it always adds up, with auto-compaction running and a restart at the end. Another has 16 callers racing `MSETNX` for overlapping pairs of seats and checks that every winner owns both its seats. I also broke it on purpose four ways (writing separate `SET`s instead of a batch, skipping the existence check in `MSETNX`, letting `MGET` read expired keys, and only applying part of a batch on replay), and each one fails a test; reading outside the lock is caught by the race detector.
+
+README numbers: 203 tests and 6 fuzz tests, 92.0% coverage.
+
+Next: the batch record is the building block for `RENAME` (a delete and a set that must happen together) and later for real transactions. The playground is still on the old WebAssembly build.

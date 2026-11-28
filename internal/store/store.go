@@ -188,6 +188,14 @@ func (s *Store) apply(r aol.Record) {
 		}
 		s.apply(aol.Record{Op: aol.OpSet, Key: r.Key, Value: v})
 		s.setDeadline(r.Key, at)
+	case aol.OpBatch:
+		recs, err := aol.SplitBatch(r.Value)
+		if err != nil {
+			return // checksummed, so only a buggy writer could get here
+		}
+		for _, sub := range recs {
+			s.apply(sub)
+		}
 	}
 }
 
